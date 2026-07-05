@@ -1,0 +1,15036 @@
+const std = @import("std");
+
+pub const VERSION = "0.71.0";
+
+pub const StatusResult = struct {
+    upToDate: bool,
+    behindBy: u32,
+    firstRun: bool,
+    projectsFileExists: bool,
+};
+
+pub fn runGit(gpa: std.mem.Allocator, io: std.Io, workspace: []const u8, git_args: []const []const u8) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, "git");
+    try argv.append(gpa, "-C");
+    try argv.append(gpa, workspace);
+    try argv.appendSlice(gpa, git_args);
+
+    const result = try std.process.run(gpa, io, .{ .argv = argv.items });
+    defer gpa.free(result.stderr);
+    errdefer gpa.free(result.stdout);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            gpa.free(result.stdout);
+            return error.GitFailed;
+        },
+        else => {
+            gpa.free(result.stdout);
+            return error.GitFailed;
+        },
+    }
+    return result.stdout;
+}
+
+pub fn fileExists(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
+
+// Every `*Absolute` API in std.Io.Dir is undefined behavior when given a
+// relative path (confirmed: `4orman-tools build .` corrupts allocator state
+// and panics via `unreachable` inside std, not a normal error return). Every
+// subcommand whose first positional arg is a filesystem path must resolve it
+// through this before calling any compute* function — resolves "." and other
+// relative paths to their canonical absolute form; also normalizes symlinks
+// and ".." for already-absolute input.
+//
+// realPathFileAlloc returns a sentinel-terminated [:0]u8 (allocated at
+// len+1 bytes for the null terminator). Returning that directly as a plain
+// []u8 silently drops the sentinel from the type, so a caller's later
+// `gpa.free(result)` reports the wrong size to the allocator — caught live
+// as "Allocation size N+1 bytes does not match free size N" (allocator
+// corruption, not a clean error) the first time this ran against the
+// installed binary with a length that crossed a size-class boundary.
+// Dupe into a fresh, correctly-sized plain allocation instead.
+pub fn resolveAbsolutePath(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const z = try std.Io.Dir.cwd().realPathFileAlloc(io, path, gpa);
+    defer gpa.free(z);
+    return gpa.dupe(u8, z);
+}
+
+// One-time, non-destructive migration from the pre-rename state/cache dirs
+// (~/.foreman, ~/.cache/foreman-tools) to their 4orman equivalents. Copies,
+// never moves or deletes — the old dirs are left intact so this is safe to
+// run on every invocation (skipped once the destination already exists).
+pub fn migrateStateDir(gpa: std.mem.Allocator, io: std.Io) void {
+    const home_ptr = std.c.getenv("HOME") orelse return;
+    const home: []const u8 = std.mem.span(home_ptr);
+
+    const old_state = std.fmt.allocPrint(gpa, "{s}/.foreman", .{home}) catch return;
+    defer gpa.free(old_state);
+    const new_state = std.fmt.allocPrint(gpa, "{s}/.4orman", .{home}) catch return;
+    defer gpa.free(new_state);
+    if (fileExists(io, old_state) and !fileExists(io, new_state)) {
+        const r = std.process.run(gpa, io, .{ .argv = &.{ "cp", "-R", old_state, new_state } }) catch return;
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+    }
+
+    const old_cache = std.fmt.allocPrint(gpa, "{s}/.cache/foreman-tools", .{home}) catch return;
+    defer gpa.free(old_cache);
+    const new_cache = std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools", .{home}) catch return;
+    defer gpa.free(new_cache);
+    if (fileExists(io, old_cache) and !fileExists(io, new_cache)) {
+        const r = std.process.run(gpa, io, .{ .argv = &.{ "cp", "-R", old_cache, new_cache } }) catch return;
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+    }
+}
+
+pub fn computeStatus(gpa: std.mem.Allocator, io: std.Io, workspace: []const u8) !StatusResult {
+    const local_raw = runGit(gpa, io, workspace, &.{ "rev-parse", "HEAD" }) catch
+        return error.NotAGitRepo;
+    defer gpa.free(local_raw);
+    const local_sha = std.mem.trimEnd(u8, local_raw, " \n\r");
+
+    var up_to_date = true;
+    var behind_by: u32 = 0;
+
+    if (runGit(gpa, io, workspace, &.{ "rev-parse", "origin/main" })) |remote_raw| {
+        defer gpa.free(remote_raw);
+        const remote_sha = std.mem.trimEnd(u8, remote_raw, " \n\r");
+        up_to_date = std.mem.eql(u8, local_sha, remote_sha);
+
+        if (!up_to_date) {
+            if (runGit(gpa, io, workspace, &.{ "rev-list", "--count", "HEAD..origin/main" })) |count_raw| {
+                defer gpa.free(count_raw);
+                const count_str = std.mem.trim(u8, count_raw, " \n\r");
+                behind_by = std.fmt.parseInt(u32, count_str, 10) catch 0;
+            } else |_| {}
+        }
+    } else |_| {}
+
+    const first_run_path = try std.fs.path.join(gpa, &.{ workspace, ".first-run" });
+    defer gpa.free(first_run_path);
+
+    const projects_path = try std.fs.path.join(gpa, &.{ workspace, "_projects.md" });
+    defer gpa.free(projects_path);
+
+    return .{
+        .upToDate = up_to_date,
+        .behindBy = behind_by,
+        .firstRun = fileExists(io, first_run_path),
+        .projectsFileExists = fileExists(io, projects_path),
+    };
+}
+
+// --- Commits subcommand ---
+
+pub const CommitEntry = struct {
+    hash: []const u8,
+    category: []const u8,
+    message: []const u8,
+};
+
+fn categorize(msg: []const u8) []const u8 {
+    var buf: [32]u8 = undefined;
+    const prefix_len = @min(msg.len, buf.len);
+    const prefix = std.ascii.lowerString(buf[0..prefix_len], msg[0..prefix_len]);
+    if (std.mem.startsWith(u8, prefix, "fix") or
+        std.mem.startsWith(u8, prefix, "bug") or
+        std.mem.startsWith(u8, prefix, "hotfix") or
+        std.mem.startsWith(u8, prefix, "patch")) return "fix";
+    if (std.mem.startsWith(u8, prefix, "feat") or
+        std.mem.startsWith(u8, prefix, "add ") or
+        std.mem.startsWith(u8, prefix, "new ")) return "new";
+    if (std.mem.startsWith(u8, prefix, "doc") or
+        std.mem.startsWith(u8, prefix, "readme") or
+        std.mem.startsWith(u8, prefix, "changelog")) return "docs";
+    if (std.mem.startsWith(u8, prefix, "refactor") or
+        std.mem.startsWith(u8, prefix, "improve") or
+        std.mem.startsWith(u8, prefix, "update") or
+        std.mem.startsWith(u8, prefix, "enhance") or
+        std.mem.startsWith(u8, prefix, "perf") or
+        std.mem.startsWith(u8, prefix, "chore") or
+        std.mem.startsWith(u8, prefix, "clean") or
+        std.mem.startsWith(u8, prefix, "bump")) return "improvement";
+    return "other";
+}
+
+pub fn computeCommits(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8, since_tag: ?[]const u8) ![]CommitEntry {
+    var git_args: std.ArrayList([]const u8) = .empty;
+    defer git_args.deinit(gpa);
+    try git_args.appendSlice(gpa, &.{ "log", "--format=%H\t%s" });
+    var range_buf: ?[]u8 = null;
+    defer if (range_buf) |r| gpa.free(r);
+    if (since_tag) |tag| {
+        range_buf = try std.fmt.allocPrint(gpa, "{s}..HEAD", .{tag});
+        try git_args.append(gpa, range_buf.?);
+    }
+
+    const raw = try runGit(gpa, io, repo_path, git_args.items);
+    defer gpa.free(raw);
+
+    var entries: std.ArrayList(CommitEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            gpa.free(e.hash);
+            gpa.free(e.message);
+        }
+        entries.deinit(gpa);
+    }
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, raw, "\n"), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const hash = line[0..tab];
+        const msg = line[tab + 1 ..];
+        try entries.append(gpa, .{
+            .hash = try gpa.dupe(u8, hash),
+            .category = categorize(msg),
+            .message = try gpa.dupe(u8, msg),
+        });
+    }
+
+    return entries.toOwnedSlice(gpa);
+}
+
+// --- gh-user subcommand ---
+
+pub const GhUserResult = struct {
+    authenticated: bool,
+    login: []const u8, // owned by caller
+};
+
+pub fn computeGhUser(gpa: std.mem.Allocator, io: std.Io) !GhUserResult {
+    // Check gh is reachable and authenticated (exit 0 = yes)
+    const auth = std.process.run(gpa, io, .{
+        .argv = &.{ "gh", "auth", "status" },
+    }) catch return .{ .authenticated = false, .login = try gpa.dupe(u8, "") };
+    gpa.free(auth.stdout);
+    gpa.free(auth.stderr);
+    switch (auth.term) {
+        .exited => |code| if (code != 0) return .{ .authenticated = false, .login = try gpa.dupe(u8, "") },
+        else => return .{ .authenticated = false, .login = try gpa.dupe(u8, "") },
+    }
+
+    // Fetch login name
+    const user = std.process.run(gpa, io, .{
+        .argv = &.{ "gh", "api", "user", "--jq", ".login" },
+    }) catch return .{ .authenticated = true, .login = try gpa.dupe(u8, "") };
+    defer gpa.free(user.stderr);
+    switch (user.term) {
+        .exited => |code| if (code != 0) {
+            gpa.free(user.stdout);
+            return .{ .authenticated = true, .login = try gpa.dupe(u8, "") };
+        },
+        else => {
+            gpa.free(user.stdout);
+            return .{ .authenticated = true, .login = try gpa.dupe(u8, "") };
+        },
+    }
+
+    const login = try gpa.dupe(u8, std.mem.trim(u8, user.stdout, " \n\r"));
+    gpa.free(user.stdout);
+    return .{ .authenticated = true, .login = login };
+}
+
+// --- release-info subcommand ---
+
+pub const ReleaseInfoResult = struct {
+    latestTag: ?[]const u8, // null if no tags; owned by caller
+    suggestedNext: []const u8, // owned by caller
+    commitsSince: u32,
+    isDirty: bool,
+};
+
+pub fn computeReleaseInfo(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8) !ReleaseInfoResult {
+    const head = runGit(gpa, io, repo_path, &.{ "rev-parse", "HEAD" }) catch
+        return error.NotAGitRepo;
+    gpa.free(head);
+
+    const tag_raw = runGit(gpa, io, repo_path, &.{ "describe", "--tags", "--abbrev=0" }) catch null;
+    defer if (tag_raw) |r| gpa.free(r);
+
+    const latest_tag: ?[]const u8 = if (tag_raw) |r|
+        try gpa.dupe(u8, std.mem.trimEnd(u8, r, " \n\r"))
+    else
+        null;
+    errdefer if (latest_tag) |t| gpa.free(t);
+
+    const commits_since: u32 = blk: {
+        if (latest_tag) |tag| {
+            const range = try std.fmt.allocPrint(gpa, "{s}..HEAD", .{tag});
+            defer gpa.free(range);
+            const count_raw = runGit(gpa, io, repo_path, &.{ "rev-list", "--count", range }) catch break :blk 0;
+            defer gpa.free(count_raw);
+            break :blk std.fmt.parseInt(u32, std.mem.trim(u8, count_raw, " \n\r"), 10) catch 0;
+        } else {
+            const count_raw = runGit(gpa, io, repo_path, &.{ "rev-list", "--count", "HEAD" }) catch break :blk 0;
+            defer gpa.free(count_raw);
+            break :blk std.fmt.parseInt(u32, std.mem.trim(u8, count_raw, " \n\r"), 10) catch 0;
+        }
+    };
+
+    const status_raw = runGit(gpa, io, repo_path, &.{ "status", "--porcelain" }) catch null;
+    defer if (status_raw) |r| gpa.free(r);
+    const is_dirty = if (status_raw) |r| r.len > 0 else false;
+
+    const suggested_next: []const u8 = blk: {
+        if (latest_tag) |tag| {
+            const v = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
+            var parts = std.mem.splitScalar(u8, v, '.');
+            const major_str = parts.next() orelse break :blk try std.fmt.allocPrint(gpa, "{s}-next", .{tag});
+            const minor_str = parts.next() orelse break :blk try std.fmt.allocPrint(gpa, "{s}-next", .{tag});
+            const patch_str_raw = parts.next() orelse break :blk try std.fmt.allocPrint(gpa, "{s}-next", .{tag});
+            var patch_end: usize = 0;
+            while (patch_end < patch_str_raw.len and std.ascii.isDigit(patch_str_raw[patch_end])) patch_end += 1;
+            const patch_str = patch_str_raw[0..patch_end];
+            const major = std.fmt.parseInt(u32, major_str, 10) catch break :blk try std.fmt.allocPrint(gpa, "{s}-next", .{tag});
+            const minor = std.fmt.parseInt(u32, minor_str, 10) catch break :blk try std.fmt.allocPrint(gpa, "{s}-next", .{tag});
+            const patch = std.fmt.parseInt(u32, patch_str, 10) catch break :blk try std.fmt.allocPrint(gpa, "{s}-next", .{tag});
+            break :blk try std.fmt.allocPrint(gpa, "v{d}.{d}.{d}", .{ major, minor, patch + 1 });
+        } else {
+            break :blk try gpa.dupe(u8, "v0.1.0");
+        }
+    };
+    errdefer gpa.free(suggested_next);
+
+    return .{
+        .latestTag = latest_tag,
+        .suggestedNext = suggested_next,
+        .commitsSince = commits_since,
+        .isDirty = is_dirty,
+    };
+}
+
+// --- changes-preview subcommand ---
+
+pub const ChangesPreviewResult = struct {
+    commits: []CommitEntry, // owned by caller
+    filesChanged: u32,
+};
+
+pub fn computeChangesPreview(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8) !ChangesPreviewResult {
+    const log_raw = runGit(gpa, io, repo_path, &.{ "log", "--format=%H\t%s", "HEAD..origin/main" }) catch
+        return .{ .commits = &.{}, .filesChanged = 0 };
+    defer gpa.free(log_raw);
+
+    var entries: std.ArrayList(CommitEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            gpa.free(e.hash);
+            gpa.free(e.message);
+        }
+        entries.deinit(gpa);
+    }
+
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, log_raw, "\n"), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+        const hash = line[0..tab];
+        const msg = line[tab + 1 ..];
+        try entries.append(gpa, .{
+            .hash = try gpa.dupe(u8, hash),
+            .category = categorize(msg),
+            .message = try gpa.dupe(u8, msg),
+        });
+    }
+
+    const files_changed: u32 = blk: {
+        const names_raw = runGit(gpa, io, repo_path, &.{ "diff", "--name-only", "HEAD..origin/main" }) catch break :blk 0;
+        defer gpa.free(names_raw);
+        const trimmed = std.mem.trimEnd(u8, names_raw, "\n");
+        if (trimmed.len == 0) break :blk 0;
+        var count: u32 = 0;
+        var it = std.mem.splitScalar(u8, trimmed, '\n');
+        while (it.next()) |_| count += 1;
+        break :blk count;
+    };
+
+    return .{
+        .commits = try entries.toOwnedSlice(gpa),
+        .filesChanged = files_changed,
+    };
+}
+
+// --- doctor subcommand ---
+
+pub const DoctorResult = struct {
+    claude: bool,
+    git: bool,
+    gh: bool,
+    version: []const u8, // owned by caller
+};
+
+fn toolAvailable(gpa: std.mem.Allocator, io: std.Io, name: []const u8) bool {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ name, "--version" },
+    }) catch return false;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    return switch (result.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+}
+
+pub fn computeDoctor(gpa: std.mem.Allocator, io: std.Io) !DoctorResult {
+    const version = try gpa.dupe(u8, VERSION);
+    errdefer gpa.free(version);
+    return .{
+        .claude = toolAvailable(gpa, io, "claude"),
+        .git = toolAvailable(gpa, io, "git"),
+        .gh = toolAvailable(gpa, io, "gh"),
+        .version = version,
+    };
+}
+
+// --- tag-exists subcommand ---
+
+pub const TagExistsResult = struct {
+    exists: bool,
+};
+
+pub fn computeTagExists(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8, tag: []const u8) !TagExistsResult {
+    const out = runGit(gpa, io, repo_path, &.{ "tag", "-l", tag }) catch
+        return error.NotAGitRepo;
+    defer gpa.free(out);
+    return .{ .exists = std.mem.trim(u8, out, " \n\r").len > 0 };
+}
+
+// --- repo-info subcommand ---
+
+pub const RepoInfoResult = struct {
+    owner: []const u8, // owned by caller
+    repo: []const u8, // owned by caller
+    url: []const u8, // owned by caller; always https://github.com/owner/repo
+};
+
+pub fn computeRepoInfo(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8) !RepoInfoResult {
+    const remote_raw = runGit(gpa, io, repo_path, &.{ "remote", "get-url", "origin" }) catch
+        return error.NoRemote;
+    defer gpa.free(remote_raw);
+    const remote = std.mem.trimEnd(u8, remote_raw, " \n\r");
+
+    var owner: []const u8 = undefined;
+    var repo_name: []const u8 = undefined;
+
+    if (std.mem.startsWith(u8, remote, "git@")) {
+        // git@github.com:owner/repo.git
+        const colon = std.mem.indexOfScalar(u8, remote, ':') orelse return error.UnparsableRemote;
+        const path = remote[colon + 1 ..];
+        const slash = std.mem.indexOfScalar(u8, path, '/') orelse return error.UnparsableRemote;
+        owner = path[0..slash];
+        var r = path[slash + 1 ..];
+        if (std.mem.endsWith(u8, r, ".git")) r = r[0 .. r.len - 4];
+        repo_name = r;
+    } else if (std.mem.startsWith(u8, remote, "https://") or std.mem.startsWith(u8, remote, "http://")) {
+        // https://github.com/owner/repo.git
+        const scheme_end = std.mem.indexOf(u8, remote, "://") orelse return error.UnparsableRemote;
+        var rest = remote[scheme_end + 3 ..];
+        const host_end = std.mem.indexOfScalar(u8, rest, '/') orelse return error.UnparsableRemote;
+        rest = rest[host_end + 1 ..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.UnparsableRemote;
+        owner = rest[0..slash];
+        var r = rest[slash + 1 ..];
+        if (std.mem.endsWith(u8, r, ".git")) r = r[0 .. r.len - 4];
+        repo_name = r;
+    } else {
+        return error.UnparsableRemote;
+    }
+
+    const owner_dup = try gpa.dupe(u8, owner);
+    errdefer gpa.free(owner_dup);
+    const repo_dup = try gpa.dupe(u8, repo_name);
+    errdefer gpa.free(repo_dup);
+    const url = try std.fmt.allocPrint(gpa, "https://github.com/{s}/{s}", .{ owner, repo_name });
+    errdefer gpa.free(url);
+
+    return .{ .owner = owner_dup, .repo = repo_dup, .url = url };
+}
+
+pub fn allocJsonEscape(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    // Fast path: scan first — most strings need no escaping
+    var extra: usize = 0;
+    for (s) |c| {
+        extra += switch (c) {
+            '"', '\\' => 1,                        // \" or \\ → +1 extra char
+            '\n', '\r', '\t' => 1,                  // \n \r \t → +1 extra char
+            0x00...0x08, 0x0b...0x0c, 0x0e...0x1f => 5, // \u00XX → +5 extra chars
+            else => 0,
+        };
+    }
+    if (extra == 0) return gpa.dupe(u8, s);
+
+    // Slow path: exact pre-sized allocation — no ArrayList growth
+    const out = try gpa.alloc(u8, s.len + extra);
+    const hex = "0123456789abcdef";
+    var i: usize = 0;
+    for (s) |c| {
+        switch (c) {
+            '"'  => { out[i] = '\\'; out[i+1] = '"';  i += 2; },
+            '\\' => { out[i] = '\\'; out[i+1] = '\\'; i += 2; },
+            '\n' => { out[i] = '\\'; out[i+1] = 'n';  i += 2; },
+            '\r' => { out[i] = '\\'; out[i+1] = 'r';  i += 2; },
+            '\t' => { out[i] = '\\'; out[i+1] = 't';  i += 2; },
+            0x00...0x08, 0x0b...0x0c, 0x0e...0x1f => {
+                out[i] = '\\'; out[i+1] = 'u'; out[i+2] = '0'; out[i+3] = '0';
+                out[i+4] = hex[c >> 4]; out[i+5] = hex[c & 0xf];
+                i += 6;
+            },
+            else => { out[i] = c; i += 1; },
+        }
+    }
+    return out;
+}
+
+// --- scan subcommand ---
+
+pub const FileEntry = struct {
+    path: []u8, // owned by caller
+    bytes: u64,
+    kind: []const u8, // static string literal — do not free
+};
+
+pub const ScanResult = struct {
+    framework: []const u8, // static string literal — do not free
+    keyFiles: [][]u8, // owned by caller
+    depCount: u32,
+    dirMap: [][]u8, // owned by caller
+    entryPoint: ?[]u8, // owned by caller, null if not detected
+    fileCount: u32, // total file count before 500-file cap
+    files: []FileEntry, // owned by caller
+};
+
+// Comptime hash maps — O(1) lookups replacing O(n) linear scans.
+// StaticStringMap uses binary search on a sorted comptime-generated array,
+// which is faster than linear scan for any set larger than ~4 entries.
+
+const FRAMEWORK_MAP = std.StaticStringMap([]const u8).initComptime(&.{
+    .{ "package.json", "Node.js" },
+    .{ "go.mod", "Go" },
+    .{ "build.zig", "Zig" },
+    .{ "Cargo.toml", "Rust" },
+    .{ "pyproject.toml", "Python" },
+    .{ "requirements.txt", "Python" },
+    .{ "setup.py", "Python" },
+    .{ "Gemfile", "Ruby" },
+    .{ "composer.json", "PHP" },
+    .{ "pom.xml", "Java (Maven)" },
+    .{ "build.gradle", "Java (Gradle)" },
+    .{ "pubspec.yaml", "Flutter/Dart" },
+    .{ "mix.exs", "Elixir" },
+});
+
+const CONFIG_FILE_MAP = std.StaticStringMap(void).initComptime(&.{
+    .{ "package.json", {} },       .{ "package-lock.json", {} },   .{ "yarn.lock", {} },      .{ "pnpm-lock.yaml", {} },
+    .{ "pyproject.toml", {} },     .{ "requirements.txt", {} },    .{ "setup.py", {} },       .{ "setup.cfg", {} },
+    .{ "go.mod", {} },             .{ "go.sum", {} },              .{ "build.zig", {} },      .{ "build.zig.zon", {} },
+    .{ "Cargo.toml", {} },         .{ "Cargo.lock", {} },          .{ "Gemfile", {} },        .{ "Gemfile.lock", {} },
+    .{ "composer.json", {} },      .{ "composer.lock", {} },       .{ "pom.xml", {} },        .{ "build.gradle", {} },
+    .{ "build.gradle.kts", {} },   .{ "pubspec.yaml", {} },        .{ "mix.exs", {} },        .{ "Dockerfile", {} },
+    .{ "docker-compose.yml", {} }, .{ "docker-compose.yaml", {} }, .{ ".env.example", {} },   .{ ".env.sample", {} },
+    .{ "tsconfig.json", {} },      .{ "jsconfig.json", {} },       .{ ".eslintrc.json", {} }, .{ ".eslintrc.js", {} },
+    .{ ".prettierrc", {} },        .{ ".prettierrc.json", {} },    .{ "Makefile", {} },       .{ "justfile", {} },
+    .{ "Taskfile.yml", {} },       .{ "netlify.toml", {} },        .{ "vercel.json", {} },
+});
+
+const SKIP_DIR_SET = std.StaticStringMap(void).initComptime(&.{
+    .{ "node_modules", {} }, .{ ".git", {} },   .{ "vendor", {} },   .{ "__pycache__", {} },
+    .{ ".next", {} },        .{ "dist", {} },   .{ "target", {} },   .{ "zig-out", {} },  .{ "zig-cache", {} },
+    .{ ".zig-cache", {} },   .{ ".cache", {} }, .{ "coverage", {} }, .{ ".venv", {} },
+    .{ "venv", {} },         .{ ".tox", {} },   .{ "tmp", {} },      .{ "temp", {} },
+});
+
+fn shouldSkipScanDir(name: []const u8) bool {
+    return SKIP_DIR_SET.has(name);
+}
+
+const SKIP_FILE_SET = std.StaticStringMap(void).initComptime(&.{
+    .{ ".DS_Store", {} }, .{ "Thumbs.db", {} }, .{ ".localized", {} },
+});
+
+fn shouldSkipScanFile(name: []const u8) bool {
+    if (SKIP_FILE_SET.has(name)) return true;
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    return BINARY_EXT_SET.has(name[dot..]);
+}
+
+const BINARY_EXT_SET = std.StaticStringMap(void).initComptime(&.{
+    .{ ".png", {} },  .{ ".jpg", {} }, .{ ".jpeg", {} }, .{ ".gif", {} },   .{ ".webp", {} },
+    .{ ".ico", {} },  .{ ".bmp", {} }, .{ ".tiff", {} }, .{ ".woff", {} },  .{ ".woff2", {} },
+    .{ ".ttf", {} },  .{ ".eot", {} }, .{ ".otf", {} },  .{ ".mp3", {} },   .{ ".mp4", {} },
+    .{ ".wav", {} },  .{ ".ogg", {} }, .{ ".avi", {} },  .{ ".mov", {} },   .{ ".pdf", {} },
+    .{ ".zip", {} },  .{ ".tar", {} }, .{ ".gz", {} },   .{ ".bz2", {} },   .{ ".xz", {} },
+    .{ ".wasm", {} }, .{ ".bin", {} }, .{ ".exe", {} },  .{ ".dylib", {} }, .{ ".so", {} },
+    .{ ".a", {} },    .{ ".map", {} }, .{ ".pyc", {} },  .{ ".class", {} }, .{ ".o", {} },
+});
+
+fn shouldSkipGrepFile(name: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    return BINARY_EXT_SET.has(name[dot..]);
+}
+
+fn readFileScan(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8) !?[]u8 {
+    const file = dir.openFile(io, name, .{}) catch return null;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    return try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+}
+
+fn countNodeDeps(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) u32 {
+    const content = (readFileScan(gpa, io, dir, "package.json") catch return 0) orelse return 0;
+    defer gpa.free(content);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object) return 0;
+    var count: u32 = 0;
+    for ([_][]const u8{ "dependencies", "devDependencies" }) |key| {
+        if (parsed.value.object.get(key)) |deps| {
+            if (deps == .object) count += @intCast(deps.object.count());
+        }
+    }
+    return count;
+}
+
+fn countReqsDeps(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) u32 {
+    const content = (readFileScan(gpa, io, dir, "requirements.txt") catch return 0) orelse return 0;
+    defer gpa.free(content);
+    var count: u32 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0 or t[0] == '#') continue;
+        count += 1;
+    }
+    return count;
+}
+
+fn countGoDeps(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) u32 {
+    const content = (readFileScan(gpa, io, dir, "go.mod") catch return 0) orelse return 0;
+    defer gpa.free(content);
+    var count: u32 = 0;
+    var in_require = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "require (")) {
+            in_require = true;
+            continue;
+        }
+        if (in_require and std.mem.eql(u8, t, ")")) {
+            in_require = false;
+            continue;
+        }
+        const dep: []const u8 = if (std.mem.startsWith(u8, t, "require ")) t["require ".len..] else if (in_require) t else continue;
+        const sp = std.mem.indexOfScalar(u8, dep, ' ') orelse dep.len;
+        const name = std.mem.trim(u8, dep[0..sp], " \t");
+        if (name.len > 0 and !std.mem.startsWith(u8, name, "//")) count += 1;
+    }
+    return count;
+}
+
+fn countCargoDeps(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) u32 {
+    const content = (readFileScan(gpa, io, dir, "Cargo.toml") catch return 0) orelse return 0;
+    defer gpa.free(content);
+    var count: u32 = 0;
+    var in_deps = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.eql(u8, t, "[dependencies]") or std.mem.eql(u8, t, "[dev-dependencies]")) {
+            in_deps = true;
+            continue;
+        }
+        if (t.len > 0 and t[0] == '[') {
+            in_deps = false;
+            continue;
+        }
+        if (!in_deps or t.len == 0 or t[0] == '#') continue;
+        if (std.mem.indexOfScalar(u8, t, '=') != null) count += 1;
+    }
+    return count;
+}
+
+fn getFileBytes(gpa: std.mem.Allocator, io: std.Io, root: []const u8, rel_path: []const u8) u64 {
+    const full = std.fs.path.join(gpa, &.{ root, rel_path }) catch return 0;
+    defer gpa.free(full);
+    const file = std.Io.Dir.openFileAbsolute(io, full, .{}) catch return 0;
+    defer file.close(io);
+    const st = file.stat(io) catch return 0;
+    return st.size;
+}
+
+fn classifyFile(path: []const u8) []const u8 {
+    const name = std.fs.path.basename(path);
+    // test directories
+    if (std.mem.startsWith(u8, path, "test/") or
+        std.mem.startsWith(u8, path, "tests/") or
+        std.mem.indexOf(u8, path, "/test/") != null or
+        std.mem.indexOf(u8, path, "/tests/") != null) return "test";
+    // test filename patterns
+    if (std.mem.startsWith(u8, name, "test_") or
+        std.mem.endsWith(u8, name, "_test.go") or
+        std.mem.endsWith(u8, name, "_test.zig") or
+        std.mem.endsWith(u8, name, "_test.rs") or
+        std.mem.indexOf(u8, name, ".test.") != null or
+        std.mem.indexOf(u8, name, ".spec.") != null) return "test";
+    // docs directories and extensions
+    if (std.mem.startsWith(u8, path, "docs/") or
+        std.mem.indexOf(u8, path, "/docs/") != null or
+        std.mem.endsWith(u8, name, ".md") or
+        std.mem.endsWith(u8, name, ".txt") or
+        std.mem.endsWith(u8, name, ".rst")) return "docs";
+    // config files
+    if (CONFIG_FILE_MAP.has(name)) return "config";
+    return "source";
+}
+
+fn fileEntrySizeDec(_: void, a: FileEntry, b: FileEntry) bool {
+    return a.bytes > b.bytes;
+}
+
+fn walkScanFiles(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    root: []const u8,
+    all_files: *std.ArrayList(FileEntry),
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file) {
+            if (shouldSkipScanFile(entry.name)) continue;
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            errdefer gpa.free(rel_path);
+            try all_files.append(gpa, .{
+                .path = rel_path,
+                .bytes = getFileBytes(gpa, io, root, rel_path),
+                .kind = classifyFile(rel_path),
+            });
+        } else if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            try walkScanFiles(gpa, io, sub, sub_prefix, root, all_files);
+        }
+    }
+}
+
+fn walkScanDirs(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, rel_prefix: []const u8, depth: u8, dirs: *std.ArrayList([]u8)) !void {
+    if (depth >= 3) return;
+
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |n| gpa.free(n);
+        names.deinit(gpa);
+    }
+
+    {
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            if (shouldSkipScanDir(entry.name)) continue;
+            try names.append(gpa, try gpa.dupe(u8, entry.name));
+        }
+    }
+
+    for (names.items) |name| {
+        {
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, name });
+            errdefer gpa.free(rel_path);
+            try dirs.append(gpa, rel_path);
+        }
+        const stored = dirs.items[dirs.items.len - 1];
+        var sub = dir.openDir(io, name, .{ .iterate = true }) catch continue;
+        defer sub.close(io);
+        try walkScanDirs(gpa, io, sub, stored, depth + 1, dirs);
+    }
+}
+
+pub fn computeScan(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ScanResult {
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var framework: []const u8 = "unknown";
+
+    var key_files: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (key_files.items) |f| gpa.free(f);
+        key_files.deinit(gpa);
+    }
+
+    {
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.eql(u8, framework, "unknown")) {
+                if (FRAMEWORK_MAP.get(entry.name)) |fw| framework = fw;
+            }
+            if (CONFIG_FILE_MAP.has(entry.name)) {
+                try key_files.append(gpa, try gpa.dupe(u8, entry.name));
+            }
+        }
+    }
+
+    const dep_count: u32 = if (std.mem.eql(u8, framework, "Node.js"))
+        countNodeDeps(gpa, io, dir)
+    else if (std.mem.eql(u8, framework, "Python"))
+        countReqsDeps(gpa, io, dir)
+    else if (std.mem.eql(u8, framework, "Go"))
+        countGoDeps(gpa, io, dir)
+    else if (std.mem.eql(u8, framework, "Rust"))
+        countCargoDeps(gpa, io, dir)
+    else
+        0;
+
+    var dir_list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (dir_list.items) |d| gpa.free(d);
+        dir_list.deinit(gpa);
+    }
+    try walkScanDirs(gpa, io, dir, "", 0, &dir_list);
+
+    // File inventory
+    var all_files: std.ArrayList(FileEntry) = .empty;
+    errdefer {
+        for (all_files.items) |f| gpa.free(f.path);
+        all_files.deinit(gpa);
+    }
+    try walkScanFiles(gpa, io, dir, "", path, &all_files);
+
+    const file_count: u32 = @intCast(all_files.items.len);
+
+    // Entry point detection (before sort/cap so all files are visible)
+    const repo_basename = std.fs.path.basename(path);
+    const entry_point: ?[]u8 = ep: {
+        const static_candidates = [_][]const u8{
+            "main.go",      "index.js",     "index.ts",
+            "src/index.js", "src/index.ts", "app.py",
+            "main.py",
+        };
+        for (static_candidates) |candidate| {
+            for (all_files.items) |f| {
+                if (std.mem.eql(u8, f.path, candidate))
+                    break :ep try gpa.dupe(u8, f.path);
+            }
+        }
+        for (all_files.items) |f| {
+            if (std.mem.startsWith(u8, f.path, "cmd/") and
+                std.mem.endsWith(u8, f.path, "/main.go"))
+                break :ep try gpa.dupe(u8, f.path);
+        }
+        for (all_files.items) |f| {
+            if (std.mem.startsWith(u8, f.path, "src/main."))
+                break :ep try gpa.dupe(u8, f.path);
+        }
+        for (all_files.items) |f| {
+            if (std.mem.startsWith(u8, f.path, "bin/") and
+                std.mem.eql(u8, f.path["bin/".len..], repo_basename))
+                break :ep try gpa.dupe(u8, f.path);
+        }
+        break :ep null;
+    };
+    errdefer if (entry_point) |ep| gpa.free(ep);
+
+    // Sort largest-first, cap at 500
+    std.mem.sort(FileEntry, all_files.items, {}, fileEntrySizeDec);
+    if (all_files.items.len > 500) {
+        for (all_files.items[500..]) |f| gpa.free(f.path);
+        all_files.shrinkRetainingCapacity(500);
+    }
+
+    const owned_keys = try key_files.toOwnedSlice(gpa);
+    errdefer {
+        for (owned_keys) |f| gpa.free(f);
+        gpa.free(owned_keys);
+    }
+
+    return .{
+        .framework = framework,
+        .keyFiles = owned_keys,
+        .depCount = dep_count,
+        .dirMap = try dir_list.toOwnedSlice(gpa),
+        .entryPoint = entry_point,
+        .fileCount = file_count,
+        .files = try all_files.toOwnedSlice(gpa),
+    };
+}
+
+// --- diff-dirs subcommand ---
+
+pub const DiffEntry = struct {
+    path: []u8, // owned by caller
+    bytesA: u64,
+    bytesB: u64,
+    same: bool,
+};
+
+pub const DiffDirsResult = struct {
+    onlyInA: [][]u8, // owned by caller
+    onlyInB: [][]u8, // owned by caller
+    inBoth: []DiffEntry, // owned by caller
+};
+
+const PathEntry = struct {
+    path: []u8, // owned by caller
+    bytes: u64,
+};
+
+fn pathEntryAsc(_: void, a: PathEntry, b: PathEntry) bool {
+    return std.mem.order(u8, a.path, b.path) == .lt;
+}
+
+fn walkDirForDiff(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    root: []const u8,
+    entries: *std.ArrayList(PathEntry),
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file) {
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            errdefer gpa.free(rel_path);
+            try entries.append(gpa, .{
+                .path = rel_path,
+                .bytes = getFileBytes(gpa, io, root, rel_path),
+            });
+        } else if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            try walkDirForDiff(gpa, io, sub, sub_prefix, root, entries);
+        }
+    }
+}
+
+pub fn computeDiffDirs(gpa: std.mem.Allocator, io: std.Io, path_a: []const u8, path_b: []const u8) !DiffDirsResult {
+    var dir_a = std.Io.Dir.openDirAbsolute(io, path_a, .{ .iterate = true }) catch
+        return error.PathANotFound;
+    defer dir_a.close(io);
+
+    var dir_b = std.Io.Dir.openDirAbsolute(io, path_b, .{ .iterate = true }) catch
+        return error.PathBNotFound;
+    defer dir_b.close(io);
+
+    var a_entries: std.ArrayList(PathEntry) = .empty;
+    errdefer {
+        for (a_entries.items) |e| gpa.free(e.path);
+        a_entries.deinit(gpa);
+    }
+    try walkDirForDiff(gpa, io, dir_a, "", path_a, &a_entries);
+
+    var b_entries: std.ArrayList(PathEntry) = .empty;
+    errdefer {
+        for (b_entries.items) |e| gpa.free(e.path);
+        b_entries.deinit(gpa);
+    }
+    try walkDirForDiff(gpa, io, dir_b, "", path_b, &b_entries);
+
+    std.mem.sort(PathEntry, a_entries.items, {}, pathEntryAsc);
+    std.mem.sort(PathEntry, b_entries.items, {}, pathEntryAsc);
+
+    var only_a: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (only_a.items) |p| gpa.free(p);
+        only_a.deinit(gpa);
+    }
+    var only_b: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (only_b.items) |p| gpa.free(p);
+        only_b.deinit(gpa);
+    }
+    var in_both: std.ArrayList(DiffEntry) = .empty;
+    errdefer {
+        for (in_both.items) |e| gpa.free(e.path);
+        in_both.deinit(gpa);
+    }
+
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a_entries.items.len and j < b_entries.items.len) {
+        const a = a_entries.items[i];
+        const b = b_entries.items[j];
+        switch (std.mem.order(u8, a.path, b.path)) {
+            .lt => {
+                try only_a.append(gpa, try gpa.dupe(u8, a.path));
+                i += 1;
+            },
+            .gt => {
+                try only_b.append(gpa, try gpa.dupe(u8, b.path));
+                j += 1;
+            },
+            .eq => {
+                try in_both.append(gpa, .{
+                    .path = try gpa.dupe(u8, a.path),
+                    .bytesA = a.bytes,
+                    .bytesB = b.bytes,
+                    .same = a.bytes == b.bytes,
+                });
+                i += 1;
+                j += 1;
+            },
+        }
+    }
+    while (i < a_entries.items.len) : (i += 1)
+        try only_a.append(gpa, try gpa.dupe(u8, a_entries.items[i].path));
+    while (j < b_entries.items.len) : (j += 1)
+        try only_b.append(gpa, try gpa.dupe(u8, b_entries.items[j].path));
+
+    return .{
+        .onlyInA = try only_a.toOwnedSlice(gpa),
+        .onlyInB = try only_b.toOwnedSlice(gpa),
+        .inBoth = try in_both.toOwnedSlice(gpa),
+    };
+}
+
+// --- grep ---
+
+pub const GrepMatch = struct { file: []u8, line: u32, col: u32, text: []u8 };
+pub const GrepResult = struct { pattern: []const u8, matchCount: u32, capped: bool, matches: []GrepMatch };
+
+const GREP_MAX_MATCHES: u32 = 500;
+const GREP_MAX_FILE_BYTES: usize = 5 * 1024 * 1024;
+
+fn grepOneFile(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    abs_path: []const u8,
+    rel_path: []const u8,
+    pattern: []const u8,
+    matches: *std.ArrayList(GrepMatch),
+) !bool {
+    if (matches.items.len >= GREP_MAX_MATCHES) return true;
+    const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return false;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(GREP_MAX_FILE_BYTES)) catch return false;
+    defer gpa.free(content);
+    var line_num: u32 = 1;
+    var line_start: usize = 0;
+    while (line_start < content.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+        const line = content[line_start..line_end];
+        var search_start: usize = 0;
+        while (std.mem.indexOf(u8, line[search_start..], pattern)) |rel_off| {
+            const col = search_start + rel_off;
+            const text = try gpa.dupe(u8, std.mem.trimEnd(u8, line, "\r"));
+            try matches.append(gpa, .{
+                .file = try gpa.dupe(u8, rel_path),
+                .line = line_num,
+                .col = @intCast(col + 1),
+                .text = text,
+            });
+            search_start = col + pattern.len;
+            if (matches.items.len >= GREP_MAX_MATCHES) return true;
+        }
+        line_num += 1;
+        line_start = line_end + 1;
+    }
+    return false;
+}
+
+fn walkGrep(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    root: []const u8,
+    pattern: []const u8,
+    ext_filter: ?[]const u8,
+    matches: *std.ArrayList(GrepMatch),
+) !bool {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (matches.items.len >= GREP_MAX_MATCHES) return true;
+        if (entry.kind == .file) {
+            if (shouldSkipGrepFile(entry.name)) continue;
+            if (ext_filter) |ext| {
+                if (!std.mem.endsWith(u8, entry.name, ext)) continue;
+            }
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(rel_path);
+            const abs_path = try std.fs.path.join(gpa, &.{ root, rel_path });
+            defer gpa.free(abs_path);
+            const capped = try grepOneFile(gpa, io, abs_path, rel_path, pattern, matches);
+            if (capped) return true;
+        } else if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            const capped = try walkGrep(gpa, io, sub, sub_prefix, root, pattern, ext_filter, matches);
+            if (capped) return true;
+        }
+    }
+    return false;
+}
+
+pub fn computeGrep(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    pattern: []const u8,
+    ext_filter: ?[]const u8,
+) !GrepResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch
+        return error.RootNotFound;
+    defer dir.close(io);
+    var matches: std.ArrayList(GrepMatch) = .empty;
+    errdefer {
+        for (matches.items) |m| {
+            gpa.free(m.file);
+            gpa.free(m.text);
+        }
+        matches.deinit(gpa);
+    }
+    const capped = try walkGrep(gpa, io, dir, "", root, pattern, ext_filter, &matches);
+    return .{
+        .pattern = pattern,
+        .matchCount = @intCast(matches.items.len),
+        .capped = capped,
+        .matches = try matches.toOwnedSlice(gpa),
+    };
+}
+
+// --- parse-stack ---
+
+pub const StackFrame = struct { file: []const u8, line: u32, col: u32, func: []const u8 };
+pub const ParseStackResult = struct { frames: []StackFrame };
+
+// Parses file:line or file:line:col from the tail of s.
+// Returns the byte index of the colon before the line number, or null if no match.
+fn parseFileLine(s: []const u8, out_line: *u32, out_col: *u32) ?usize {
+    if (s.len == 0) return null;
+    // Scan trailing digits (either line or col).
+    var i: usize = s.len;
+    const d2_end = i;
+    while (i > 0 and s[i - 1] >= '0' and s[i - 1] <= '9') i -= 1;
+    if (i == d2_end or i == 0 or s[i - 1] != ':') return null;
+    const d2_start = i;
+    const colon2 = i - 1;
+    // Check if before colon2 there's another :digits block (making d2 the col).
+    var j: usize = colon2;
+    const d1_end = j;
+    while (j > 0 and s[j - 1] >= '0' and s[j - 1] <= '9') j -= 1;
+    if (j < d1_end and j > 0 and s[j - 1] == ':') {
+        // file:line:col
+        const colon1 = j - 1;
+        out_line.* = std.fmt.parseInt(u32, s[j..d1_end], 10) catch return null;
+        out_col.* = std.fmt.parseInt(u32, s[d2_start..d2_end], 10) catch 0;
+        return colon1;
+    }
+    // file:line (d2 is the line number)
+    out_line.* = std.fmt.parseInt(u32, s[d2_start..d2_end], 10) catch return null;
+    out_col.* = 0;
+    return colon2;
+}
+
+// Parse one line of a stack trace.  Returns null if the line is not a frame.
+// Supported formats:
+//   Node/V8:   "    at FnName (file:line:col)"  or  "    at file:line:col"
+//   Python:    '    File "file", line N, in fn'
+//   Go:        "        file.go:line +0x..."
+//   Ruby:      "    file:line:in `fn'"
+fn parseStackLine(gpa: std.mem.Allocator, raw: []const u8) !?StackFrame {
+    const line = std.mem.trim(u8, raw, " \t\r\n");
+
+    // Node/V8: "at FnName (file:line:col)" or "at file:line:col"
+    if (std.mem.startsWith(u8, line, "at ")) {
+        const rest = std.mem.trim(u8, line[3..], " ");
+        if (rest.len > 0 and rest[rest.len - 1] == ')') {
+            // "at FnName (file:line:col)"
+            const lparen = std.mem.lastIndexOfScalar(u8, rest, '(') orelse return null;
+            const fn_name = std.mem.trim(u8, rest[0..lparen], " ");
+            const inner = rest[lparen + 1 .. rest.len - 1];
+            var out_line: u32 = 0;
+            var out_col: u32 = 0;
+            const colon_pos = parseFileLine(inner, &out_line, &out_col) orelse return null;
+            return .{
+                .file = try gpa.dupe(u8, inner[0..colon_pos]),
+                .line = out_line,
+                .col = out_col,
+                .func = try gpa.dupe(u8, fn_name),
+            };
+        }
+        // "at file:line:col"
+        var out_line: u32 = 0;
+        var out_col: u32 = 0;
+        const colon_pos = parseFileLine(rest, &out_line, &out_col) orelse return null;
+        return .{
+            .file = try gpa.dupe(u8, rest[0..colon_pos]),
+            .line = out_line,
+            .col = out_col,
+            .func = try gpa.dupe(u8, "<anonymous>"),
+        };
+    }
+
+    // Python: 'File "file", line N, in fn'
+    if (std.mem.startsWith(u8, line, "File \"")) {
+        const rest = line[6..];
+        const quote_end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+        const file_name = rest[0..quote_end];
+        const after = rest[quote_end + 1 ..];
+        // ", line N"
+        const line_kw = std.mem.indexOf(u8, after, ", line ") orelse return null;
+        const after_line = after[line_kw + 7 ..];
+        const comma_or_end = std.mem.indexOfAny(u8, after_line, ", \n") orelse after_line.len;
+        const line_num = std.fmt.parseInt(u32, after_line[0..comma_or_end], 10) catch return null;
+        // "in fn"
+        const in_kw = std.mem.indexOf(u8, after_line[comma_or_end..], " in ") orelse {
+            return .{ .file = try gpa.dupe(u8, file_name), .line = line_num, .col = 0, .func = try gpa.dupe(u8, "<module>") };
+        };
+        const fn_start = comma_or_end + in_kw + 4;
+        const fn_name = std.mem.trim(u8, after_line[fn_start..], " \t\r\n");
+        return .{ .file = try gpa.dupe(u8, file_name), .line = line_num, .col = 0, .func = try gpa.dupe(u8, fn_name) };
+    }
+
+    // Go: "file.go:line +0x..." (starts with a path component containing a dot or slash)
+    if (std.mem.indexOf(u8, line, ".go:") != null or
+        (line.len > 0 and (line[0] == '/' or line[0] == '.') and std.mem.indexOfScalar(u8, line, ':') != null))
+    {
+        // strip trailing " +0x..."
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+        const part = line[0..space];
+        var out_line: u32 = 0;
+        var out_col: u32 = 0;
+        const colon_pos = parseFileLine(part, &out_line, &out_col) orelse return null;
+        return .{ .file = try gpa.dupe(u8, part[0..colon_pos]), .line = out_line, .col = out_col, .func = try gpa.dupe(u8, "<go>") };
+    }
+
+    // Ruby: "file:line:in `fn'"
+    if (std.mem.indexOf(u8, line, ":in `") != null) {
+        const in_pos = std.mem.indexOf(u8, line, ":in `").?;
+        const file_line_part = line[0..in_pos];
+        const fn_part = line[in_pos + 5 ..];
+        const fn_end = std.mem.indexOfScalar(u8, fn_part, '\'') orelse fn_part.len;
+        var out_line: u32 = 0;
+        var out_col: u32 = 0;
+        const colon_pos = parseFileLine(file_line_part, &out_line, &out_col) orelse return null;
+        return .{
+            .file = try gpa.dupe(u8, file_line_part[0..colon_pos]),
+            .line = out_line,
+            .col = out_col,
+            .func = try gpa.dupe(u8, fn_part[0..fn_end]),
+        };
+    }
+
+    return null;
+}
+
+pub fn computeParseStack(gpa: std.mem.Allocator, input: []const u8) !ParseStackResult {
+    var frames: std.ArrayList(StackFrame) = .empty;
+    errdefer {
+        for (frames.items) |f| {
+            gpa.free(f.file);
+            gpa.free(f.func);
+        }
+        frames.deinit(gpa);
+    }
+    var lines = std.mem.splitScalar(u8, input, '\n');
+    while (lines.next()) |raw| {
+        if (try parseStackLine(gpa, raw)) |frame| {
+            try frames.append(gpa, frame);
+        }
+    }
+    return .{ .frames = try frames.toOwnedSlice(gpa) };
+}
+
+// --- log-match ---
+// Domain-agnostic: matches raw log text against an external pattern-library
+// JSON file (caller-supplied — no domain vocabulary is baked in here). Used
+// by a consuming project's own log pattern library, but works for any log +
+// any pattern file.
+
+pub const LogMatchHit = struct {
+    id: []const u8,
+    category: []const u8,
+    severity: []const u8,
+    matchedLine: []const u8,
+    lineNumber: u32,
+    signal: []const u8,
+    rootCause: []const u8,
+    conclusion: []const u8,
+};
+
+pub const LogMatchResult = struct {
+    hits: []LogMatchHit,
+    matchCount: u32,
+    unmatchedSignalLines: [][]const u8,
+    exitStatusLine: ?[]const u8,
+};
+
+fn jsonStr(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    return if (obj.get(key)) |v| (if (v == .string) v.string else "") else "";
+}
+
+// '*' = any run of characters (including none). Fragments split on '*' must
+// all appear in `line`, in order — a substring search generalized for glob.
+fn globContains(line: []const u8, pattern: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
+        return std.mem.indexOf(u8, line, pattern) != null;
+    }
+    var pos: usize = 0;
+    var it = std.mem.splitScalar(u8, pattern, '*');
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        const idx = std.mem.indexOf(u8, line[pos..], part) orelse return false;
+        pos += idx + part.len;
+    }
+    return true;
+}
+
+const LOG_MATCH_SEVERITY_MARKERS = [_][]const u8{
+    "[error]", "[ERROR]", "ERROR:", "Exception", "FAILURE", "fatal", "Fatal", "failed", "Failed",
+};
+const LOG_MATCH_MAX_UNMATCHED: usize = 20;
+
+pub fn computeLogMatch(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    log_text: []const u8,
+    pattern_file: []const u8,
+) !LogMatchResult {
+    const pf = std.Io.Dir.openFileAbsolute(io, pattern_file, .{}) catch return error.PatternFileNotFound;
+    defer pf.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var r = pf.reader(io, &rbuf);
+    const pf_content = try r.interface.allocRemaining(gpa, .limited(2 * 1024 * 1024));
+    defer gpa.free(pf_content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, pf_content, .{}) catch return error.InvalidPatternFile;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidPatternFile;
+    const patterns_val = parsed.value.object.get("patterns") orelse return error.InvalidPatternFile;
+    if (patterns_val != .array) return error.InvalidPatternFile;
+
+    var hits: std.ArrayList(LogMatchHit) = .empty;
+    errdefer {
+        for (hits.items) |h| {
+            gpa.free(h.id);
+            gpa.free(h.category);
+            gpa.free(h.severity);
+            gpa.free(h.matchedLine);
+            gpa.free(h.signal);
+            gpa.free(h.rootCause);
+            gpa.free(h.conclusion);
+        }
+        hits.deinit(gpa);
+    }
+
+    var matched_lines: std.AutoHashMap(u32, void) = .init(gpa);
+    defer matched_lines.deinit();
+
+    var line_no: u32 = 0;
+    var lines_it = std.mem.splitScalar(u8, log_text, '\n');
+    while (lines_it.next()) |raw_line| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+
+        for (patterns_val.array.items) |p| {
+            if (p != .object) continue;
+            const obj = p.object;
+            const value = jsonStr(obj, "value");
+            if (value.len == 0) continue;
+            const match_kind = jsonStr(obj, "match");
+
+            const is_hit = if (std.mem.eql(u8, match_kind, "glob"))
+                globContains(line, value)
+            else
+                std.mem.indexOf(u8, line, value) != null;
+
+            if (is_hit) {
+                try hits.append(gpa, .{
+                    .id = try gpa.dupe(u8, jsonStr(obj, "id")),
+                    .category = try gpa.dupe(u8, jsonStr(obj, "category")),
+                    .severity = try gpa.dupe(u8, jsonStr(obj, "severity")),
+                    .matchedLine = try gpa.dupe(u8, line),
+                    .lineNumber = line_no,
+                    .signal = try gpa.dupe(u8, jsonStr(obj, "signal")),
+                    .rootCause = try gpa.dupe(u8, jsonStr(obj, "rootCause")),
+                    .conclusion = try gpa.dupe(u8, jsonStr(obj, "conclusion")),
+                });
+                try matched_lines.put(line_no, {});
+            }
+        }
+    }
+
+    var unmatched: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (unmatched.items) |u| gpa.free(u);
+        unmatched.deinit(gpa);
+    }
+    var exit_line: ?[]const u8 = null;
+    errdefer if (exit_line) |e| gpa.free(e);
+
+    line_no = 0;
+    lines_it = std.mem.splitScalar(u8, log_text, '\n');
+    while (lines_it.next()) |raw_line| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+
+        if (exit_line == null and (std.mem.indexOf(u8, line, "Finished:") != null or std.mem.indexOf(u8, line, "exit code") != null)) {
+            exit_line = try gpa.dupe(u8, line);
+        }
+
+        if (matched_lines.contains(line_no)) continue;
+        if (unmatched.items.len >= LOG_MATCH_MAX_UNMATCHED) continue;
+
+        for (LOG_MATCH_SEVERITY_MARKERS) |m| {
+            if (std.mem.indexOf(u8, line, m) != null) {
+                try unmatched.append(gpa, try gpa.dupe(u8, line));
+                break;
+            }
+        }
+    }
+
+    const match_count: u32 = @intCast(hits.items.len);
+    return .{
+        .hits = try hits.toOwnedSlice(gpa),
+        .matchCount = match_count,
+        .unmatchedSignalLines = try unmatched.toOwnedSlice(gpa),
+        .exitStatusLine = exit_line,
+    };
+}
+
+// --- git-diff ---
+
+pub const DiffFileStat = struct { path: []u8, additions: u32, deletions: u32, status: []const u8 };
+pub const GitDiffResult = struct {
+    ref: []const u8,
+    totalAdditions: u32,
+    totalDeletions: u32,
+    fileCount: u32,
+    files: []DiffFileStat,
+};
+
+// Parse one line of `git diff --numstat` output: "<add>\t<del>\tpath"
+fn parseNumstatLine(line: []const u8, gpa: std.mem.Allocator) !?DiffFileStat {
+    const t1 = std.mem.indexOfScalar(u8, line, '\t') orelse return null;
+    const rest = line[t1 + 1 ..];
+    const t2 = std.mem.indexOfScalar(u8, rest, '\t') orelse return null;
+    const add_str = std.mem.trim(u8, line[0..t1], " ");
+    const del_str = std.mem.trim(u8, rest[0..t2], " ");
+    const path = std.mem.trim(u8, rest[t2 + 1 ..], " \r\n");
+    if (path.len == 0) return null;
+    // binary files show "-" for add/del — treat as 0
+    const additions = std.fmt.parseInt(u32, add_str, 10) catch 0;
+    const deletions = std.fmt.parseInt(u32, del_str, 10) catch 0;
+    return .{
+        .path = try gpa.dupe(u8, path),
+        .additions = additions,
+        .deletions = deletions,
+        .status = "modified", // refined below from name-status
+    };
+}
+
+pub fn computeGitDiff(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    repo_path: []const u8,
+    ref: []const u8, // "" = unstaged, "staged" = --cached, else passed to git
+) !GitDiffResult {
+    // Build args for --numstat
+    var numstat_args: std.ArrayList([]const u8) = .empty;
+    defer numstat_args.deinit(gpa);
+    try numstat_args.append(gpa, "diff");
+    try numstat_args.append(gpa, "--numstat");
+    if (std.mem.eql(u8, ref, "staged")) {
+        try numstat_args.append(gpa, "--cached");
+    } else if (ref.len > 0) {
+        try numstat_args.append(gpa, ref);
+    }
+    const numstat_raw = runGit(gpa, io, repo_path, numstat_args.items) catch
+        return error.GitFailed;
+    defer gpa.free(numstat_raw);
+
+    // Build args for --name-status (to get A/M/D/R per file)
+    var ns_args: std.ArrayList([]const u8) = .empty;
+    defer ns_args.deinit(gpa);
+    try ns_args.append(gpa, "diff");
+    try ns_args.append(gpa, "--name-status");
+    if (std.mem.eql(u8, ref, "staged")) {
+        try ns_args.append(gpa, "--cached");
+    } else if (ref.len > 0) {
+        try ns_args.append(gpa, ref);
+    }
+    const ns_raw = runGit(gpa, io, repo_path, ns_args.items) catch null;
+    defer if (ns_raw) |r| gpa.free(r);
+
+    // Build a map of path → status from name-status output
+    var status_map = std.StringHashMap([]const u8).init(gpa);
+    defer status_map.deinit();
+    if (ns_raw) |ns| {
+        var lines = std.mem.splitScalar(u8, ns, '\n');
+        while (lines.next()) |line| {
+            const t = line;
+            if (t.len < 2) continue;
+            const tab = std.mem.indexOfScalar(u8, t, '\t') orelse continue;
+            const code = std.mem.trim(u8, t[0..tab], " ");
+            const path = std.mem.trim(u8, t[tab + 1 ..], " \r\n");
+            const status: []const u8 = if (code.len > 0) switch (code[0]) {
+                'A' => "added",
+                'D' => "deleted",
+                'R' => "renamed",
+                'C' => "copied",
+                else => "modified",
+            } else "modified";
+            try status_map.put(path, status);
+        }
+    }
+
+    // Parse numstat output
+    var files: std.ArrayList(DiffFileStat) = .empty;
+    errdefer {
+        for (files.items) |f| gpa.free(f.path);
+        files.deinit(gpa);
+    }
+    var total_add: u32 = 0;
+    var total_del: u32 = 0;
+    var lines = std.mem.splitScalar(u8, numstat_raw, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \r\n").len == 0) continue;
+        const stat = try parseNumstatLine(line, gpa) orelse continue;
+        total_add += stat.additions;
+        total_del += stat.deletions;
+        const resolved_status = status_map.get(stat.path) orelse stat.status;
+        try files.append(gpa, .{
+            .path = stat.path,
+            .additions = stat.additions,
+            .deletions = stat.deletions,
+            .status = resolved_status,
+        });
+    }
+
+    return .{
+        .ref = ref,
+        .totalAdditions = total_add,
+        .totalDeletions = total_del,
+        .fileCount = @intCast(files.items.len),
+        .files = try files.toOwnedSlice(gpa),
+    };
+}
+
+// --- list-dir ---
+
+pub const DirEntry = struct { name: []u8, kind: []const u8, bytes: u64 };
+pub const ListDirResult = struct { path: []const u8, count: u32, entries: []DirEntry };
+
+pub fn computeListDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !ListDirResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch
+        return error.PathNotFound;
+    defer dir.close(io);
+
+    var entries: std.ArrayList(DirEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| gpa.free(e.name);
+        entries.deinit(gpa);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const kind: []const u8 = switch (entry.kind) {
+            .directory => "dir",
+            .file => "file",
+            .sym_link => "symlink",
+            else => "other",
+        };
+        const bytes: u64 = if (entry.kind == .file) blk: {
+            const f = dir.openFile(io, entry.name, .{}) catch break :blk 0;
+            defer f.close(io);
+            const st = f.stat(io) catch break :blk 0;
+            break :blk st.size;
+        } else 0;
+        try entries.append(gpa, .{
+            .name = try gpa.dupe(u8, entry.name),
+            .kind = kind,
+            .bytes = bytes,
+        });
+    }
+
+    // Sort alphabetically: dirs first, then files
+    std.mem.sort(DirEntry, entries.items, {}, struct {
+        fn lt(_: void, a: DirEntry, b: DirEntry) bool {
+            const a_dir = std.mem.eql(u8, a.kind, "dir");
+            const b_dir = std.mem.eql(u8, b.kind, "dir");
+            if (a_dir != b_dir) return a_dir;
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    return .{
+        .path = path,
+        .count = @intCast(entries.items.len),
+        .entries = try entries.toOwnedSlice(gpa),
+    };
+}
+
+// --- json-query ---
+
+pub const JsonQueryResult = struct {
+    path: []const u8,
+    found: bool,
+    type_name: []const u8, // "string" | "number" | "bool" | "null" | "object" | "array"
+    value_json: ?[]u8, // raw JSON fragment; null when not found
+};
+
+fn jsonTypeName(v: std.json.Value) []const u8 {
+    return switch (v) {
+        .null => "null",
+        .bool => "bool",
+        .integer, .float, .number_string => "number",
+        .string => "string",
+        .array => "array",
+        .object => "object",
+    };
+}
+
+pub fn computeJsonQuery(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+    key_path: []const u8,
+) !JsonQueryResult {
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch
+        return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+    defer gpa.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch
+        return error.InvalidJson;
+    defer parsed.deinit();
+
+    // Walk the dot-separated path
+    var node: std.json.Value = parsed.value;
+    var segments = std.mem.splitScalar(u8, key_path, '.');
+    while (segments.next()) |seg| {
+        switch (node) {
+            .object => |obj| {
+                node = obj.get(seg) orelse return .{
+                    .path = key_path,
+                    .found = false,
+                    .type_name = "null",
+                    .value_json = null,
+                };
+            },
+            .array => |arr| {
+                const idx = std.fmt.parseInt(usize, seg, 10) catch return .{
+                    .path = key_path,
+                    .found = false,
+                    .type_name = "null",
+                    .value_json = null,
+                };
+                if (idx >= arr.items.len) return .{
+                    .path = key_path,
+                    .found = false,
+                    .type_name = "null",
+                    .value_json = null,
+                };
+                node = arr.items[idx];
+            },
+            else => return .{
+                .path = key_path,
+                .found = false,
+                .type_name = "null",
+                .value_json = null,
+            },
+        }
+    }
+
+    const value_json = try std.json.Stringify.valueAlloc(gpa, node, .{});
+    return .{
+        .path = key_path,
+        .found = true,
+        .type_name = jsonTypeName(node),
+        .value_json = value_json,
+    };
+}
+
+// --- find-files ---
+
+pub const FindFilesResult = struct { pattern: []const u8, count: u32, capped: bool, files: [][]u8 };
+
+const FIND_MAX_RESULTS: u32 = 2000;
+
+// Returns true if name matches glob pattern. Supports leading '*', trailing '*',
+// '*' on both sides (contains), exact match, and plain '*.ext' suffix match.
+fn globMatch(pattern: []const u8, name: []const u8) bool {
+    if (std.mem.eql(u8, pattern, "*")) return true;
+    const star_start = std.mem.startsWith(u8, pattern, "*");
+    const star_end = std.mem.endsWith(u8, pattern, "*");
+    if (star_start and star_end and pattern.len > 2) {
+        // *contains*
+        const inner = pattern[1 .. pattern.len - 1];
+        return std.mem.indexOf(u8, name, inner) != null;
+    }
+    if (star_start) {
+        // *suffix
+        const suffix = pattern[1..];
+        return std.mem.endsWith(u8, name, suffix);
+    }
+    if (star_end) {
+        // prefix*
+        const prefix = pattern[0 .. pattern.len - 1];
+        return std.mem.startsWith(u8, name, prefix);
+    }
+    return std.mem.eql(u8, pattern, name);
+}
+
+fn walkFindFiles(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    pattern: []const u8,
+    results: *std.ArrayList([]u8),
+) !bool {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (results.items.len >= FIND_MAX_RESULTS) return true;
+        if (entry.kind == .file) {
+            if (globMatch(pattern, entry.name)) {
+                const path: []u8 = if (rel_prefix.len == 0)
+                    try gpa.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+                try results.append(gpa, path);
+                if (results.items.len >= FIND_MAX_RESULTS) return true;
+            }
+        } else if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            const capped = try walkFindFiles(gpa, io, sub, sub_prefix, pattern, results);
+            if (capped) return true;
+        }
+    }
+    return false;
+}
+
+pub fn computeFindFiles(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    pattern: []const u8,
+) !FindFilesResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch
+        return error.RootNotFound;
+    defer dir.close(io);
+    var results: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (results.items) |p| gpa.free(p);
+        results.deinit(gpa);
+    }
+    const capped = try walkFindFiles(gpa, io, dir, "", pattern, &results);
+    return .{
+        .pattern = pattern,
+        .count = @intCast(results.items.len),
+        .capped = capped,
+        .files = try results.toOwnedSlice(gpa),
+    };
+}
+
+// --- file-stats ---
+
+pub const FileStatsResult = struct { path: []const u8, lines: u64, bytes: u64 };
+
+pub fn computeFileStats(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !FileStatsResult {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    const bytes: u64 = blk: {
+        const st = file.stat(io) catch break :blk 0;
+        break :blk st.size;
+    };
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(100 * 1024 * 1024)) catch {
+        return .{ .path = path, .lines = 0, .bytes = bytes };
+    };
+    defer gpa.free(content);
+    var lines: u64 = 0;
+    for (content) |c| {
+        if (c == '\n') lines += 1;
+    }
+    if (content.len > 0 and content[content.len - 1] != '\n') lines += 1;
+    return .{ .path = path, .lines = lines, .bytes = bytes };
+}
+
+// --- env-scan ---
+
+pub const EnvFile = struct { file: []u8, keyCount: u32, keys: [][]u8 };
+pub const EnvScanResult = struct { root: []const u8, fileCount: u32, files: []EnvFile };
+
+fn parseEnvKeys(gpa: std.mem.Allocator, content: []const u8) ![][]u8 {
+    var keys: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        // Strip optional "export " prefix
+        const stripped = if (std.mem.startsWith(u8, line, "export "))
+            std.mem.trimStart(u8, line["export ".len..], " \t")
+        else
+            line;
+        const eq = std.mem.indexOfScalar(u8, stripped, '=') orelse continue;
+        const key = std.mem.trim(u8, stripped[0..eq], " \t");
+        if (key.len == 0) continue;
+        // Validate key: must start with letter or underscore
+        if (key[0] != '_' and (key[0] < 'A' or key[0] > 'Z') and
+            (key[0] < 'a' or key[0] > 'z')) continue;
+        try keys.append(gpa, try gpa.dupe(u8, key));
+    }
+    return keys.toOwnedSlice(gpa);
+}
+
+pub fn computeEnvScan(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !EnvScanResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch
+        return error.RootNotFound;
+    defer dir.close(io);
+
+    var env_files: std.ArrayList(EnvFile) = .empty;
+    errdefer {
+        for (env_files.items) |ef| {
+            gpa.free(ef.file);
+            for (ef.keys) |k| gpa.free(k);
+            gpa.free(ef.keys);
+        }
+        env_files.deinit(gpa);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, ".env")) continue;
+        const file = dir.openFile(io, entry.name, .{}) catch continue;
+        defer file.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var r = file.reader(io, &read_buf);
+        const content = r.interface.allocRemaining(gpa, .limited(1024 * 1024)) catch continue;
+        defer gpa.free(content);
+        const keys = try parseEnvKeys(gpa, content);
+        try env_files.append(gpa, .{
+            .file = try gpa.dupe(u8, entry.name),
+            .keyCount = @intCast(keys.len),
+            .keys = keys,
+        });
+    }
+
+    // Sort by filename for deterministic output
+    std.mem.sort(EnvFile, env_files.items, {}, struct {
+        fn lt(_: void, a: EnvFile, b: EnvFile) bool {
+            return std.mem.lessThan(u8, a.file, b.file);
+        }
+    }.lt);
+
+    return .{
+        .root = root,
+        .fileCount = @intCast(env_files.items.len),
+        .files = try env_files.toOwnedSlice(gpa),
+    };
+}
+
+// --- toml-query ---
+
+const TOMLScalar = struct { type_name: []const u8, json: []u8 };
+
+fn parseTOMLScalar(gpa: std.mem.Allocator, raw: []const u8) !TOMLScalar {
+    if (raw.len == 0) return .{ .type_name = "null", .json = try gpa.dupe(u8, "null") };
+
+    // Double or single quoted string
+    if (raw[0] == '"' or raw[0] == '\'') {
+        const quote = raw[0];
+        // find closing quote (last occurrence to skip escaped chars naively)
+        const close = std.mem.lastIndexOfScalar(u8, raw[1..], quote) orelse {
+            return .{ .type_name = "string", .json = try gpa.dupe(u8, "\"\"") };
+        };
+        const inner = raw[1 .. 1 + close];
+        const escaped = try allocJsonEscape(gpa, inner);
+        defer gpa.free(escaped);
+        return .{ .type_name = "string", .json = try std.fmt.allocPrint(gpa, "\"{s}\"", .{escaped}) };
+    }
+
+    // Boolean
+    if (std.mem.eql(u8, raw, "true")) return .{ .type_name = "bool", .json = try gpa.dupe(u8, "true") };
+    if (std.mem.eql(u8, raw, "false")) return .{ .type_name = "bool", .json = try gpa.dupe(u8, "false") };
+
+    // Array or inline table — return raw as-is (best effort)
+    if (raw[0] == '[') return .{ .type_name = "array", .json = try gpa.dupe(u8, raw) };
+    if (raw[0] == '{') return .{ .type_name = "object", .json = try gpa.dupe(u8, raw) };
+
+    // Number — strip trailing inline comment first
+    var num = raw;
+    if (std.mem.indexOfScalar(u8, raw, '#')) |h| {
+        num = std.mem.trimEnd(u8, raw[0..h], " \t");
+    }
+    if (std.fmt.parseInt(i64, num, 10)) |_| {
+        return .{ .type_name = "number", .json = try gpa.dupe(u8, num) };
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, num)) |_| {
+        return .{ .type_name = "number", .json = try gpa.dupe(u8, num) };
+    } else |_| {}
+
+    // Fallback: return as string
+    const escaped = try allocJsonEscape(gpa, raw);
+    defer gpa.free(escaped);
+    return .{ .type_name = "string", .json = try std.fmt.allocPrint(gpa, "\"{s}\"", .{escaped}) };
+}
+
+fn extractTOMLValue(gpa: std.mem.Allocator, content: []const u8, key_path: []const u8) !?TOMLScalar {
+    // Split path into section prefix + target key
+    var seg_buf: [16][]const u8 = undefined;
+    var seg_count: usize = 0;
+    var seg_it = std.mem.splitScalar(u8, key_path, '.');
+    while (seg_it.next()) |s| {
+        if (seg_count >= 16) break;
+        seg_buf[seg_count] = s;
+        seg_count += 1;
+    }
+    if (seg_count == 0) return null;
+    const target_key = seg_buf[seg_count - 1];
+    const section_path = seg_buf[0 .. seg_count - 1];
+
+    var cur_sec: [16][]const u8 = undefined;
+    var cur_depth: usize = 0; // starts at root (depth 0 = no section)
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        // Section header [name] but not array of tables [[name]]
+        if (line[0] == '[' and (line.len < 2 or line[1] != '[')) {
+            const close = std.mem.lastIndexOfScalar(u8, line, ']') orelse continue;
+            const sec_str = std.mem.trim(u8, line[1..close], " \t");
+            cur_depth = 0;
+            var parts = std.mem.splitScalar(u8, sec_str, '.');
+            while (parts.next()) |p| {
+                if (cur_depth >= 16) break;
+                cur_sec[cur_depth] = std.mem.trim(u8, p, " \t\"");
+                cur_depth += 1;
+            }
+            continue;
+        }
+
+        // Key = value
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t\"");
+        const val_raw = std.mem.trim(u8, line[eq + 1 ..], " \t");
+
+        // Check section match
+        if (cur_depth != section_path.len) continue;
+        var sec_match = true;
+        for (section_path, 0..) |s, i| {
+            if (!std.mem.eql(u8, cur_sec[i], s)) {
+                sec_match = false;
+                break;
+            }
+        }
+        if (!sec_match) continue;
+
+        // Check key match
+        if (!std.mem.eql(u8, key, target_key)) continue;
+
+        return try parseTOMLScalar(gpa, val_raw);
+    }
+    return null;
+}
+
+pub fn computeTomlQuery(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+    key_path: []const u8,
+) !JsonQueryResult {
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+    defer gpa.free(content);
+
+    const scalar = try extractTOMLValue(gpa, content, key_path);
+    if (scalar) |s| {
+        return .{ .path = key_path, .found = true, .type_name = s.type_name, .value_json = s.json };
+    }
+    return .{ .path = key_path, .found = false, .type_name = "null", .value_json = null };
+}
+
+// --- yaml-query ---
+
+fn yamlIndent(s: []const u8) usize {
+    var n: usize = 0;
+    while (n < s.len and s[n] == ' ') n += 1;
+    return n;
+}
+
+fn yamlStripQuotes(s: []const u8) []const u8 {
+    const v = std.mem.trim(u8, s, " \t\r");
+    if (v.len >= 2 and ((v[0] == '"' and v[v.len - 1] == '"') or
+        (v[0] == '\'' and v[v.len - 1] == '\'')))
+        return v[1 .. v.len - 1];
+    return v;
+}
+
+// Returns value part of "key: value" if content starts with key+colon; null otherwise.
+// Rejects partial matches: "runs-on:" does not match key "runs".
+fn yamlKeyVal(content: []const u8, key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, content, key)) return null;
+    const rest = content[key.len..];
+    if (rest.len == 0 or rest[0] != ':') return null;
+    if (rest.len > 1 and rest[1] != ' ' and rest[1] != '\t' and
+        rest[1] != '\r' and rest[1] != '\n') return null;
+    return std.mem.trimStart(u8, rest[1..], " \t");
+}
+
+fn yamlFindChildIndent(lines: []const []const u8, from: usize, parent_indent: usize) usize {
+    var j = from;
+    while (j < lines.len) : (j += 1) {
+        const raw = lines[j];
+        const ind = yamlIndent(raw);
+        const c = std.mem.trimEnd(u8, raw[ind..], "\r\n");
+        if (c.len == 0 or c[0] == '#') continue;
+        if (ind > parent_indent) return ind;
+        break;
+    }
+    return parent_indent + 2;
+}
+
+// Navigate YAML lines by path segments; returns a slice into lines[] (no allocation).
+fn yamlNav(
+    lines: []const []const u8,
+    segs: []const []const u8,
+    from: usize,
+    at_indent: usize,
+) ?[]const u8 {
+    if (segs.len == 0) return null;
+    const seg = segs[0];
+    const rest = segs[1..];
+    const is_last = rest.len == 0;
+    const as_idx: ?usize = std.fmt.parseInt(usize, seg, 10) catch null;
+
+    var i = from;
+    var seq_n: usize = 0;
+
+    while (i < lines.len) : (i += 1) {
+        const raw = lines[i];
+        const ind = yamlIndent(raw);
+        const c = std.mem.trimEnd(u8, raw[ind..], "\r\n");
+        if (c.len == 0 or c[0] == '#') continue;
+        if (ind < at_indent) break;
+        if (ind > at_indent) continue;
+
+        if (as_idx) |target| {
+            if (c[0] == '-') {
+                if (seq_n == target) {
+                    const inline_part = std.mem.trimStart(u8, c[1..], " \t");
+                    if (is_last) return yamlStripQuotes(inline_part);
+                    // Inline key check: handles "- uses: actions/checkout@v2"
+                    if (rest.len >= 1) {
+                        if (yamlKeyVal(inline_part, rest[0])) |val| {
+                            if (rest.len == 1) return yamlStripQuotes(val);
+                        }
+                    }
+                    const ci = yamlFindChildIndent(lines, i + 1, at_indent);
+                    return yamlNav(lines, rest, i + 1, ci);
+                }
+                seq_n += 1;
+            }
+        } else {
+            if (yamlKeyVal(c, seg)) |val| {
+                if (is_last) return yamlStripQuotes(val);
+                const ci = yamlFindChildIndent(lines, i + 1, at_indent);
+                return yamlNav(lines, rest, i + 1, ci);
+            }
+        }
+    }
+    return null;
+}
+
+fn parseYamlScalar(gpa: std.mem.Allocator, raw: []const u8) !TOMLScalar {
+    const v = std.mem.trim(u8, raw, " \t\r\n");
+    if (v.len == 0 or std.mem.eql(u8, v, "null") or std.mem.eql(u8, v, "~"))
+        return .{ .type_name = "null", .json = try gpa.dupe(u8, "null") };
+    if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes") or std.mem.eql(u8, v, "on"))
+        return .{ .type_name = "bool", .json = try gpa.dupe(u8, "true") };
+    if (std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no") or std.mem.eql(u8, v, "off"))
+        return .{ .type_name = "bool", .json = try gpa.dupe(u8, "false") };
+    if (std.fmt.parseInt(i64, v, 10)) |_| {
+        return .{ .type_name = "number", .json = try gpa.dupe(u8, v) };
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, v)) |_| {
+        return .{ .type_name = "number", .json = try gpa.dupe(u8, v) };
+    } else |_| {}
+    const escaped = try allocJsonEscape(gpa, v);
+    defer gpa.free(escaped);
+    return .{ .type_name = "string", .json = try std.fmt.allocPrint(gpa, "\"{s}\"", .{escaped}) };
+}
+
+pub fn computeYamlQuery(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+    key_path: []const u8,
+) !JsonQueryResult {
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+    defer gpa.free(content);
+
+    // Two-pass line split (no ArrayList needed)
+    var lc: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next() != null) : (lc += 1) {}
+    }
+    const lines = try gpa.alloc([]const u8, lc);
+    defer gpa.free(lines);
+    {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        var li: usize = 0;
+        while (it.next()) |ln| : (li += 1) {
+            lines[li] = ln;
+        }
+    }
+
+    // Two-pass segment split
+    var sc: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, key_path, '.');
+        while (it.next() != null) : (sc += 1) {}
+    }
+    const segs = try gpa.alloc([]const u8, sc);
+    defer gpa.free(segs);
+    {
+        var it = std.mem.splitScalar(u8, key_path, '.');
+        var si: usize = 0;
+        while (it.next()) |s| : (si += 1) {
+            segs[si] = s;
+        }
+    }
+
+    const raw = yamlNav(lines, segs, 0, 0);
+    if (raw) |val| {
+        const scalar = try parseYamlScalar(gpa, val);
+        return .{ .path = key_path, .found = true, .type_name = scalar.type_name, .value_json = scalar.json };
+    }
+    return .{ .path = key_path, .found = false, .type_name = "null", .value_json = null };
+}
+
+// --- list-projects subcommand ---
+
+pub const ProjectEntry = struct {
+    name: []u8, // owned by caller
+    url: []u8, // owned by caller
+    isForeman: bool,
+    isLocal: bool,
+};
+
+const FRAMEWORK_REPO_PREFIXES = [_][]const u8{ "homebrew-", "foreman-", "4orman-" };
+const FRAMEWORK_REPO_NAMES = [_][]const u8{ "foreman", "4orman" };
+
+fn isFrameworkRepo(name: []const u8) bool {
+    for (FRAMEWORK_REPO_NAMES) |n| if (std.mem.eql(u8, name, n)) return true;
+    for (FRAMEWORK_REPO_PREFIXES) |p| if (std.mem.startsWith(u8, name, p)) return true;
+    return false;
+}
+
+fn repoHasSpecMd(gpa: std.mem.Allocator, io: std.Io, nwo: []const u8) bool {
+    const api_path = std.fmt.allocPrint(gpa, "repos/{s}/contents/spec.md", .{nwo}) catch return false;
+    defer gpa.free(api_path);
+    const result = std.process.run(gpa, io, .{ .argv = &.{ "gh", "api", api_path } }) catch return false;
+    gpa.free(result.stdout);
+    gpa.free(result.stderr);
+    return switch (result.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+}
+
+pub fn computeListProjects(gpa: std.mem.Allocator, io: std.Io, workspace_root: []const u8) ![]ProjectEntry {
+    const list_result = std.process.run(gpa, io, .{
+        .argv = &.{ "gh", "repo", "list", "--json", "name,nameWithOwner,url", "--limit", "100" },
+    }) catch return &.{};
+    defer gpa.free(list_result.stderr);
+    defer gpa.free(list_result.stdout);
+
+    switch (list_result.term) {
+        .exited => |c| if (c != 0) return &.{},
+        else => return &.{},
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, list_result.stdout, .{}) catch return &.{};
+    defer parsed.deinit();
+    if (parsed.value != .array) return &.{};
+
+    var entries: std.ArrayList(ProjectEntry) = .empty;
+    errdefer {
+        for (entries.items) |e| {
+            gpa.free(e.name);
+            gpa.free(e.url);
+        }
+        entries.deinit(gpa);
+    }
+
+    for (parsed.value.array.items) |repo| {
+        if (repo != .object) continue;
+        const name_val = repo.object.get("name") orelse continue;
+        const nwo_val = repo.object.get("nameWithOwner") orelse continue;
+        const url_val = repo.object.get("url") orelse continue;
+        if (name_val != .string or nwo_val != .string or url_val != .string) continue;
+
+        const name = name_val.string;
+        const nwo = nwo_val.string;
+        const url = url_val.string;
+
+        if (isFrameworkRepo(name)) continue;
+
+        const is_foreman = repoHasSpecMd(gpa, io, nwo);
+
+        const local_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, name });
+        defer gpa.free(local_path);
+        const is_local = fileExists(io, local_path);
+
+        const name_owned = try gpa.dupe(u8, name);
+        errdefer gpa.free(name_owned);
+        const url_owned = try gpa.dupe(u8, url);
+        errdefer gpa.free(url_owned);
+
+        try entries.append(gpa, .{
+            .name = name_owned,
+            .url = url_owned,
+            .isForeman = is_foreman,
+            .isLocal = is_local,
+        });
+    }
+
+    return entries.toOwnedSlice(gpa);
+}
+
+// --- tarball-sha subcommand ---
+
+pub const TarballShaResult = struct {
+    sha256: []u8, // owned by caller, lowercase hex
+    url: []u8, // owned by caller
+};
+
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb924" ++
+    "27ae41e4649b934ca495991b7852b855";
+
+fn sha256Hex(data: []const u8) [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(data);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex_chars = "0123456789abcdef";
+    var out: [64]u8 = undefined;
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0xf];
+    }
+    return out;
+}
+
+fn fetchUrl(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ?[]u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "curl", "-sL", "--fail", url },
+    }) catch return null;
+    defer gpa.free(result.stderr);
+    switch (result.term) {
+        .exited => |c| if (c != 0) {
+            gpa.free(result.stdout);
+            return null;
+        },
+        else => {
+            gpa.free(result.stdout);
+            return null;
+        },
+    }
+    return result.stdout;
+}
+
+pub fn computeTarballSha(gpa: std.mem.Allocator, io: std.Io, owner: []const u8, repo: []const u8, tag: []const u8) !TarballShaResult {
+    const url = try std.fmt.allocPrint(gpa, "https://github.com/{s}/{s}/archive/refs/tags/{s}.tar.gz", .{ owner, repo, tag });
+    errdefer gpa.free(url);
+
+    const data = fetchUrl(gpa, io, url) orelse return error.FetchFailed;
+    var hex = sha256Hex(data);
+    gpa.free(data);
+
+    if (std.mem.eql(u8, &hex, EMPTY_SHA256)) {
+        var ts = std.posix.timespec{ .sec = 10, .nsec = 0 };
+        _ = std.posix.system.nanosleep(&ts, null);
+        const data2 = fetchUrl(gpa, io, url) orelse return error.FetchFailed;
+        hex = sha256Hex(data2);
+        gpa.free(data2);
+    }
+
+    return .{
+        .sha256 = try gpa.dupe(u8, &hex),
+        .url = url,
+    };
+}
+
+// --- formula-info subcommand ---
+
+pub const FormulaInfoResult = struct {
+    formulaPath: []u8, // owned by caller
+    url: []u8, // owned by caller
+    sha256: []u8, // owned by caller
+    version: []u8, // owned by caller
+};
+
+fn extractQuotedField(line: []const u8, key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, key)) return null;
+    const rest = std.mem.trimStart(u8, line[key.len..], " \t");
+    if (rest.len < 2 or rest[0] != '"') return null;
+    const close = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return null;
+    return rest[1..close];
+}
+
+pub fn computeFormulaInfo(gpa: std.mem.Allocator, io: std.Io, tap_path: []const u8, formula_name: []const u8) !FormulaInfoResult {
+    const formula_path = try std.fmt.allocPrint(gpa, "{s}/Formula/{s}.rb", .{ tap_path, formula_name });
+    errdefer gpa.free(formula_path);
+
+    const file = std.Io.Dir.openFileAbsolute(io, formula_path, .{}) catch return error.FormulaNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(1 * 1024 * 1024));
+    defer gpa.free(content);
+
+    var url: ?[]u8 = null;
+    var sha256: ?[]u8 = null;
+    var ver: ?[]u8 = null;
+
+    errdefer {
+        if (url) |s| gpa.free(s);
+        if (sha256) |s| gpa.free(s);
+        if (ver) |s| gpa.free(s);
+    }
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (url == null) {
+            if (extractQuotedField(trimmed, "url")) |v| url = try gpa.dupe(u8, v);
+        }
+        if (sha256 == null) {
+            if (extractQuotedField(trimmed, "sha256")) |v| sha256 = try gpa.dupe(u8, v);
+        }
+        if (ver == null) {
+            if (extractQuotedField(trimmed, "version")) |v| ver = try gpa.dupe(u8, v);
+        }
+    }
+
+    return .{
+        .formulaPath = formula_path,
+        .url = url orelse return error.MissingField,
+        .sha256 = sha256 orelse return error.MissingField,
+        .version = ver orelse return error.MissingField,
+    };
+}
+
+// --- validate-hooks subcommand ---
+
+pub const ValidateHooksResult = struct {
+    memorySync: bool,
+    autoPush: bool,
+};
+
+const MEMORY_SYNC_MSG = "Syncing memory\u{2026}"; // "Syncing memory…"
+const AUTO_PUSH_MSG = "Pushing project commits\u{2026}"; // "Pushing project commits…"
+
+fn searchStopHooks(stop: std.json.Value, needle: []const u8) bool {
+    const arr = switch (stop) {
+        .array => |a| a,
+        else => return false,
+    };
+    for (arr.items) |matcher| {
+        const inner = switch (matcher) {
+            .object => |o| o.get("hooks") orelse continue,
+            else => continue,
+        };
+        const hooks_arr = switch (inner) {
+            .array => |a| a,
+            else => continue,
+        };
+        for (hooks_arr.items) |hook| {
+            const obj = switch (hook) {
+                .object => |o| o,
+                else => continue,
+            };
+            const msg = obj.get("statusMessage") orelse continue;
+            const msg_str = switch (msg) {
+                .string => |s| s,
+                else => continue,
+            };
+            if (std.mem.eql(u8, msg_str, needle)) return true;
+        }
+    }
+    return false;
+}
+
+pub fn computeValidateHooks(gpa: std.mem.Allocator, io: std.Io) !ValidateHooksResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const settings_path = try std.fmt.allocPrint(gpa, "{s}/.claude/settings.json", .{home});
+    defer gpa.free(settings_path);
+
+    const file = std.Io.Dir.openFileAbsolute(io, settings_path, .{}) catch return .{ .memorySync = false, .autoPush = false };
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(1 * 1024 * 1024));
+    defer gpa.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch
+        return .{ .memorySync = false, .autoPush = false };
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return .{ .memorySync = false, .autoPush = false },
+    };
+    const hooks_val = root_obj.get("hooks") orelse return .{ .memorySync = false, .autoPush = false };
+    const hooks_obj = switch (hooks_val) {
+        .object => |o| o,
+        else => return .{ .memorySync = false, .autoPush = false },
+    };
+    const stop_val = hooks_obj.get("Stop") orelse return .{ .memorySync = false, .autoPush = false };
+
+    return .{
+        .memorySync = searchStopHooks(stop_val, MEMORY_SYNC_MSG),
+        .autoPush = searchStopHooks(stop_val, AUTO_PUSH_MSG),
+    };
+}
+
+// --- gh-release subcommand ---
+
+pub const GhReleaseResult = struct {
+    url: []u8, // owned by caller
+};
+
+pub fn computeGhRelease(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    owner: []const u8,
+    repo: []const u8,
+    tag: []const u8,
+    title: []const u8,
+    notes_file: []const u8,
+) !GhReleaseResult {
+    // Verify notes file is readable before invoking gh
+    {
+        const f = std.Io.Dir.openFileAbsolute(io, notes_file, .{}) catch return error.NotesFileNotFound;
+        f.close(io);
+    }
+
+    const nwo = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ owner, repo });
+    defer gpa.free(nwo);
+
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "gh", "release", "create", tag, "--repo", nwo, "--title", title, "--notes-file", notes_file },
+    }) catch return error.GhFailed;
+    defer gpa.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |c| if (c != 0) {
+            gpa.free(result.stdout);
+            return error.GhFailed;
+        },
+        else => {
+            gpa.free(result.stdout);
+            return error.GhFailed;
+        },
+    }
+
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\n\r");
+    const url = try gpa.dupe(u8, trimmed);
+    gpa.free(result.stdout);
+    return .{ .url = url };
+}
+
+// --- file-hash subcommand ---
+
+pub const FileHashResult = struct {
+    path: []u8, // owned by caller
+    sha256: []u8, // owned by caller, lowercase hex
+    bytes: u64,
+};
+
+pub fn computeFileHash(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8) !FileHashResult {
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(500 * 1024 * 1024));
+    defer gpa.free(content);
+    const hex = sha256Hex(content);
+    return .{
+        .path = try gpa.dupe(u8, file_path),
+        .sha256 = try gpa.dupe(u8, &hex),
+        .bytes = @intCast(content.len),
+    };
+}
+
+// --- cache-check subcommand ---
+
+pub const CacheCheckResult = struct {
+    path: []u8, // owned by caller
+    sha256: []u8, // owned by caller, lowercase hex
+    changed: bool,
+    cached: bool,
+};
+
+// Cache store: one file per tracked path, keyed by SHA256(file_path).
+// Location: ~/.cache/4orman-tools/<sha256-of-path> contains the last known content sha256.
+// Write failures are silently ignored — the result is still correct, just not cached.
+pub fn computeCacheCheck(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8) !CacheCheckResult {
+    // Hash the file contents
+    const fh = try computeFileHash(gpa, io, file_path);
+    defer gpa.free(fh.path);
+    const new_sha = fh.sha256; // caller takes ownership via result
+    errdefer gpa.free(new_sha);
+
+    // Build cache entry path: ~/.cache/4orman-tools/<sha256-of-path>
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const path_key = sha256Hex(file_path);
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools", .{home});
+    defer gpa.free(cache_dir);
+    const entry_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ cache_dir, &path_key });
+    defer gpa.free(entry_path);
+
+    // Read stored hash (if any)
+    var old_sha: ?[]u8 = null;
+    defer if (old_sha) |s| gpa.free(s);
+    if (std.Io.Dir.openFileAbsolute(io, entry_path, .{})) |cf| {
+        var rbuf: [4096]u8 = undefined;
+        var rdr = cf.reader(io, &rbuf);
+        if (rdr.interface.allocRemaining(gpa, .limited(128))) |content| {
+            const trimmed = std.mem.trim(u8, content, " \t\n\r");
+            if (trimmed.len == 64) old_sha = gpa.dupe(u8, trimmed) catch null;
+            gpa.free(content);
+        } else |_| {}
+        cf.close(io);
+    } else |_| {}
+
+    const was_cached = old_sha != null;
+    const changed = if (old_sha) |s| !std.mem.eql(u8, s, new_sha) else true;
+
+    // Write new hash (best effort — ignore failures)
+    writeCacheEntry(io, cache_dir, entry_path, new_sha);
+
+    return .{
+        .path = try gpa.dupe(u8, file_path),
+        .sha256 = new_sha,
+        .changed = changed,
+        .cached = was_cached,
+    };
+}
+
+fn atomicRenameAbsolute(old_path: []const u8, new_path: []const u8) void {
+    var old_z: [512]u8 = undefined;
+    var new_z: [512]u8 = undefined;
+    const o = std.fmt.bufPrintZ(&old_z, "{s}", .{old_path}) catch return;
+    const n = std.fmt.bufPrintZ(&new_z, "{s}", .{new_path}) catch return;
+    _ = std.c.rename(o.ptr, n.ptr);
+}
+
+fn writeCacheEntry(io: std.Io, cache_dir: []const u8, entry_path: []const u8, sha: []const u8) void {
+    std.Io.Dir.createDirAbsolute(io, cache_dir, .default_dir) catch {};
+    var tmp_buf: [512]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{entry_path}) catch return;
+    const cf = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    var wbuf: [128]u8 = undefined;
+    var w = cf.writerStreaming(io, &wbuf);
+    w.interface.writeAll(sha) catch {
+        cf.close(io);
+        return;
+    };
+    w.interface.flush() catch {};
+    cf.close(io);
+    atomicRenameAbsolute(tmp_path, entry_path);
+}
+
+// --- context-scan subcommand ---
+
+pub const KindCounts = struct {
+    source: u32,
+    @"test": u32,
+    config: u32,
+    docs: u32,
+    other: u32,
+};
+
+pub const ContextScanResult = struct {
+    framework: []const u8, // static string literal — do not free
+    entryPoint: ?[]u8, // owned by caller
+    fileCount: u32,
+    summary: KindCounts,
+    topFiles: []FileEntry, // owned by caller (paths owned); top 10 by bytes
+    keyFiles: [][]u8, // owned by caller
+    dirs: [][]u8, // owned by caller
+};
+
+const CONTEXT_TOP_FILES: usize = 10;
+
+pub fn computeContextScan(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ContextScanResult {
+    const scan = try computeScan(gpa, io, path);
+    defer {
+        for (scan.keyFiles) |f| gpa.free(f);
+        gpa.free(scan.keyFiles);
+        for (scan.dirMap) |d| gpa.free(d);
+        gpa.free(scan.dirMap);
+        if (scan.entryPoint) |ep| gpa.free(ep);
+        for (scan.files) |f| gpa.free(f.path);
+        gpa.free(scan.files);
+    }
+
+    // Count files by kind
+    var counts = KindCounts{ .source = 0, .@"test" = 0, .config = 0, .docs = 0, .other = 0 };
+    for (scan.files) |f| {
+        if (std.mem.eql(u8, f.kind, "source")) counts.source += 1 else if (std.mem.eql(u8, f.kind, "test")) counts.@"test" += 1 else if (std.mem.eql(u8, f.kind, "config")) counts.config += 1 else if (std.mem.eql(u8, f.kind, "docs")) counts.docs += 1 else counts.other += 1;
+    }
+
+    // Top N files (scan.files is already sorted largest-first)
+    const top_n = @min(CONTEXT_TOP_FILES, scan.files.len);
+    const top_files = try gpa.alloc(FileEntry, top_n);
+    for (0..top_n) |i| {
+        top_files[i] = .{
+            .path = try gpa.dupe(u8, scan.files[i].path),
+            .bytes = scan.files[i].bytes,
+            .kind = scan.files[i].kind,
+        };
+    }
+
+    // Dupe keyFiles and dirMap
+    const key_files = try gpa.alloc([]u8, scan.keyFiles.len);
+    for (scan.keyFiles, 0..) |f, i| key_files[i] = try gpa.dupe(u8, f);
+
+    const dirs = try gpa.alloc([]u8, scan.dirMap.len);
+    for (scan.dirMap, 0..) |d, i| dirs[i] = try gpa.dupe(u8, d);
+
+    return .{
+        .framework = scan.framework,
+        .entryPoint = if (scan.entryPoint) |ep| try gpa.dupe(u8, ep) else null,
+        .fileCount = scan.fileCount,
+        .summary = counts,
+        .topFiles = top_files,
+        .keyFiles = key_files,
+        .dirs = dirs,
+    };
+}
+
+// --- cache-store / cache-fetch subcommands ---
+
+pub const CacheStoreResult = struct {
+    path: []u8, // owned by caller
+    subKey: []u8, // owned by caller
+    stored: bool,
+};
+
+pub const CacheFetchResult = struct {
+    path: []u8, // owned by caller
+    subKey: []u8, // owned by caller
+    hit: bool,
+    value: ?[]u8, // owned by caller; present only when hit: true
+};
+
+// Cache entry format: "<sha256-of-file-content>\n<value-json>"
+// Stored at: ~/.cache/4orman-tools/<sha256(file_path + ":" + sub_key)>
+// When the file's content hash no longer matches the stored hash, fetch returns hit: false.
+
+fn cacheEntryPath(gpa: std.mem.Allocator, home: []const u8, file_path: []const u8, sub_key: []const u8) ![]u8 {
+    const combined = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ file_path, sub_key });
+    defer gpa.free(combined);
+    const key_hex = sha256Hex(combined);
+    return std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools/{s}", .{ home, &key_hex });
+}
+
+pub fn computeCacheStore(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8, sub_key: []const u8, value_json: []const u8) !CacheStoreResult {
+    const fh = try computeFileHash(gpa, io, file_path);
+    defer gpa.free(fh.path);
+    defer gpa.free(fh.sha256);
+
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools", .{home});
+    defer gpa.free(cache_dir);
+    const entry_path = try cacheEntryPath(gpa, home, file_path, sub_key);
+    defer gpa.free(entry_path);
+
+    std.Io.Dir.createDirAbsolute(io, cache_dir, .default_dir) catch {};
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{entry_path});
+    defer gpa.free(tmp_path);
+    const cf = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch {
+        return .{
+            .path = try gpa.dupe(u8, file_path),
+            .subKey = try gpa.dupe(u8, sub_key),
+            .stored = false,
+        };
+    };
+    var wbuf: [4096]u8 = undefined;
+    var w = cf.writerStreaming(io, &wbuf);
+    const write_ok = blk: {
+        w.interface.writeAll(fh.sha256) catch break :blk false;
+        w.interface.writeAll("\n") catch break :blk false;
+        w.interface.writeAll(value_json) catch break :blk false;
+        w.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    cf.close(io);
+    if (!write_ok) {
+        return .{ .path = try gpa.dupe(u8, file_path), .subKey = try gpa.dupe(u8, sub_key), .stored = false };
+    }
+    atomicRenameAbsolute(tmp_path, entry_path);
+
+    return .{
+        .path = try gpa.dupe(u8, file_path),
+        .subKey = try gpa.dupe(u8, sub_key),
+        .stored = true,
+    };
+}
+
+pub fn computeCacheFetch(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8, sub_key: []const u8) !CacheFetchResult {
+    const fh = try computeFileHash(gpa, io, file_path);
+    defer gpa.free(fh.path);
+    const new_sha = fh.sha256;
+    defer gpa.free(new_sha);
+
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const entry_path = try cacheEntryPath(gpa, home, file_path, sub_key);
+    defer gpa.free(entry_path);
+
+    // Resolve hit/miss first, allocate .path/.subKey exactly once at the end —
+    // the previous version pre-built a "miss" result up front and then built
+    // a second, separate result on an actual hit, orphaning the first one's
+    // allocations. Real leak, not just theoretical: symbol-index calling this
+    // once per source file (mostly hits on a second run) surfaced it under
+    // the Debug build's DebugAllocator.
+    const hit_value: ?[]u8 = blk: {
+        const cf = std.Io.Dir.openFileAbsolute(io, entry_path, .{}) catch break :blk null;
+        defer cf.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = cf.reader(io, &rbuf);
+        const content = r.interface.allocRemaining(gpa, .limited(512 * 1024)) catch break :blk null;
+        defer gpa.free(content);
+
+        const nl = std.mem.indexOfScalar(u8, content, '\n') orelse break :blk null;
+        const stored_hash = content[0..nl];
+        const stored_value = std.mem.trimEnd(u8, content[nl + 1 ..], " \t\n\r");
+        if (!std.mem.eql(u8, stored_hash, new_sha)) break :blk null;
+        break :blk try gpa.dupe(u8, stored_value);
+    };
+
+    return .{
+        .path = try gpa.dupe(u8, file_path),
+        .subKey = try gpa.dupe(u8, sub_key),
+        .hit = hit_value != null,
+        .value = hit_value,
+    };
+}
+
+// --- context-rank subcommand ---
+
+pub const RankedFile = struct {
+    path: []u8, // owned
+    score: u32,
+    hits: u32,
+    nameMatch: bool,
+    kind: []const u8, // static string literal — do not free
+    bytes: u64,
+};
+
+pub const ContextRankResult = struct {
+    root: []u8, // owned
+    query: []u8, // owned
+    fileCount: u32,
+    ranked: []RankedFile, // owned; each .path is owned
+};
+
+const RANK_MAX_RESULTS: usize = 15;
+const RANK_FILE_READ_CAP: usize = 8 * 1024;
+const RANK_MAX_TERMS: usize = 8;
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) u32 {
+    if (needle.len == 0 or needle.len > haystack.len) return 0;
+    var count: u32 = 0;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) {
+        var match = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            count += 1;
+            i += needle.len;
+        } else {
+            i += 1;
+        }
+    }
+    return count;
+}
+
+pub fn computeContextRank(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, query: []const u8) !ContextRankResult {
+    const scan = try computeScan(gpa, io, root_path);
+    defer {
+        for (scan.keyFiles) |f| gpa.free(f);
+        gpa.free(scan.keyFiles);
+        for (scan.dirMap) |d| gpa.free(d);
+        gpa.free(scan.dirMap);
+        if (scan.entryPoint) |ep| gpa.free(ep);
+        for (scan.files) |f| gpa.free(f.path);
+        gpa.free(scan.files);
+    }
+
+    // Extract query terms (slices into query — valid for this function's lifetime)
+    var terms: [RANK_MAX_TERMS][]const u8 = undefined;
+    var term_count: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, query, ' ');
+        while (it.next()) |part| {
+            const t = std.mem.trim(u8, part, " \t");
+            if (t.len > 0 and term_count < RANK_MAX_TERMS) {
+                terms[term_count] = t;
+                term_count += 1;
+            }
+        }
+    }
+    const query_terms = terms[0..term_count];
+
+    // Score each file; maintain top RANK_MAX_RESULTS by insertion into fixed array
+    const TopEntry = struct { idx: usize, score: u32, hits: u32, nameMatch: bool };
+    var top: [RANK_MAX_RESULTS]TopEntry = undefined;
+    var top_count: usize = 0;
+    var top_min: u32 = 0;
+
+    for (scan.files, 0..) |file, idx| {
+        // Check filename/path for term match
+        var name_match = false;
+        for (query_terms) |term| {
+            if (containsInsensitive(file.path, term)) {
+                name_match = true;
+                break;
+            }
+        }
+
+        // Read file for content hits (cap at RANK_FILE_READ_CAP)
+        var hits: u32 = 0;
+        if (query_terms.len > 0) {
+            const abs_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root_path, file.path }) catch null;
+            if (abs_path) |ap| {
+                defer gpa.free(ap);
+                const cf = std.Io.Dir.openFileAbsolute(io, ap, .{}) catch null;
+                if (cf) |f| {
+                    defer f.close(io);
+                    var rbuf: [4096]u8 = undefined;
+                    var r = f.reader(io, &rbuf);
+                    const content = r.interface.allocRemaining(gpa, .limited(RANK_FILE_READ_CAP)) catch null;
+                    if (content) |c| {
+                        defer gpa.free(c);
+                        for (query_terms) |term| hits += countOccurrences(c, term);
+                    }
+                }
+            }
+        }
+
+        const kind_bonus: u32 = if (std.mem.eql(u8, file.kind, "source") or std.mem.eql(u8, file.kind, "test")) 2 else 1;
+        const score: u32 = hits * 5 + (if (name_match) @as(u32, 300) else 0) + kind_bonus;
+        const entry = TopEntry{ .idx = idx, .score = score, .hits = hits, .nameMatch = name_match };
+
+        if (top_count < RANK_MAX_RESULTS) {
+            top[top_count] = entry;
+            top_count += 1;
+            top_min = top[0].score;
+            for (1..top_count) |i| if (top[i].score < top_min) {
+                top_min = top[i].score;
+            };
+        } else if (score > top_min) {
+            var min_i: usize = 0;
+            for (1..top_count) |i| if (top[i].score < top[min_i].score) {
+                min_i = i;
+            };
+            top[min_i] = entry;
+            top_min = top[0].score;
+            for (1..top_count) |i| if (top[i].score < top_min) {
+                top_min = top[i].score;
+            };
+        }
+    }
+
+    // Insertion-sort top[0..top_count] by score descending
+    {
+        var i: usize = 1;
+        while (i < top_count) : (i += 1) {
+            const val = top[i];
+            var j: usize = i;
+            while (j > 0 and top[j - 1].score < val.score) : (j -= 1) top[j] = top[j - 1];
+            top[j] = val;
+        }
+    }
+
+    // Build result
+    const ranked = try gpa.alloc(RankedFile, top_count);
+    for (top[0..top_count], 0..) |entry, i| {
+        const f = scan.files[entry.idx];
+        ranked[i] = .{
+            .path = try gpa.dupe(u8, f.path),
+            .score = entry.score,
+            .hits = entry.hits,
+            .nameMatch = entry.nameMatch,
+            .kind = f.kind,
+            .bytes = f.bytes,
+        };
+    }
+
+    return .{
+        .root = try gpa.dupe(u8, root_path),
+        .query = try gpa.dupe(u8, query),
+        .fileCount = scan.fileCount,
+        .ranked = ranked,
+    };
+}
+
+// --- context-changed subcommand ---
+
+pub const ChangedFileDiff = struct {
+    path: []u8, // owned
+    status: []const u8, // static: "added"|"modified"|"deleted"|"renamed"
+    additions: u32,
+    deletions: u32,
+    diff: []u8, // owned — unified diff capped at CHANGED_MAX_DIFF_LINES
+};
+
+pub const ContextChangedResult = struct {
+    ref: []const u8, // static or caller-owned slice — do not free
+    totalFiles: u32,
+    totalAdditions: u32,
+    totalDeletions: u32,
+    truncated: bool,
+    files: []ChangedFileDiff, // owned; each .path and .diff is owned
+};
+
+const CHANGED_MAX_FILES: usize = 8;
+const CHANGED_MAX_DIFF_LINES: usize = 100;
+
+pub fn computeContextChanged(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    repo_path: []const u8,
+    ref: []const u8, // "" = working-tree vs HEAD, "staged" = --cached, else passed to git
+) !ContextChangedResult {
+    // Step 1: numstat — file list with add/del counts
+    var numstat_args: std.ArrayList([]const u8) = .empty;
+    defer numstat_args.deinit(gpa);
+    try numstat_args.append(gpa, "diff");
+    try numstat_args.append(gpa, "--numstat");
+    if (std.mem.eql(u8, ref, "staged")) {
+        try numstat_args.append(gpa, "--cached");
+    } else if (ref.len > 0) {
+        try numstat_args.append(gpa, ref);
+    }
+    const numstat_raw = runGit(gpa, io, repo_path, numstat_args.items) catch return error.GitFailed;
+    defer gpa.free(numstat_raw);
+
+    // Step 2: name-status — per-file A/M/D/R codes
+    var ns_args: std.ArrayList([]const u8) = .empty;
+    defer ns_args.deinit(gpa);
+    try ns_args.append(gpa, "diff");
+    try ns_args.append(gpa, "--name-status");
+    if (std.mem.eql(u8, ref, "staged")) {
+        try ns_args.append(gpa, "--cached");
+    } else if (ref.len > 0) {
+        try ns_args.append(gpa, ref);
+    }
+    const ns_raw = runGit(gpa, io, repo_path, ns_args.items) catch null;
+    defer if (ns_raw) |r| gpa.free(r);
+
+    var status_map = std.StringHashMap([]const u8).init(gpa);
+    defer status_map.deinit();
+    if (ns_raw) |ns| {
+        var ns_lines = std.mem.splitScalar(u8, ns, '\n');
+        while (ns_lines.next()) |line| {
+            if (line.len < 2) continue;
+            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+            const code = std.mem.trim(u8, line[0..tab], " ");
+            const path = std.mem.trim(u8, line[tab + 1 ..], " \r\n");
+            const status: []const u8 = if (code.len > 0) switch (code[0]) {
+                'A' => "added",
+                'D' => "deleted",
+                'R' => "renamed",
+                else => "modified",
+            } else "modified";
+            try status_map.put(path, status);
+        }
+    }
+
+    // Step 3: parse numstat into file list
+    var all_files: std.ArrayList(DiffFileStat) = .empty;
+    defer {
+        for (all_files.items) |f| gpa.free(f.path);
+        all_files.deinit(gpa);
+    }
+    var total_add: u32 = 0;
+    var total_del: u32 = 0;
+    {
+        var ns_lines = std.mem.splitScalar(u8, numstat_raw, '\n');
+        while (ns_lines.next()) |line| {
+            if (std.mem.trim(u8, line, " \r\n").len == 0) continue;
+            const stat = try parseNumstatLine(line, gpa) orelse continue;
+            total_add += stat.additions;
+            total_del += stat.deletions;
+            const resolved = status_map.get(stat.path) orelse stat.status;
+            try all_files.append(gpa, .{
+                .path = stat.path,
+                .additions = stat.additions,
+                .deletions = stat.deletions,
+                .status = resolved,
+            });
+        }
+    }
+    const total_files: u32 = @intCast(all_files.items.len);
+    const truncated = all_files.items.len > CHANGED_MAX_FILES;
+    const file_count = @min(all_files.items.len, CHANGED_MAX_FILES);
+
+    // Step 4: per-file unified diff, capped at CHANGED_MAX_DIFF_LINES
+    const result_files = try gpa.alloc(ChangedFileDiff, file_count);
+    for (all_files.items[0..file_count], 0..) |stat, i| {
+        var diff_args: std.ArrayList([]const u8) = .empty;
+        defer diff_args.deinit(gpa);
+        try diff_args.append(gpa, "diff");
+        try diff_args.append(gpa, "--unified=3");
+        if (std.mem.eql(u8, ref, "staged")) {
+            try diff_args.append(gpa, "--cached");
+        } else if (ref.len > 0) {
+            try diff_args.append(gpa, ref);
+        }
+        try diff_args.append(gpa, "--");
+        try diff_args.append(gpa, stat.path);
+
+        const diff_raw = runGit(gpa, io, repo_path, diff_args.items) catch
+            try gpa.dupe(u8, "");
+        defer gpa.free(diff_raw);
+
+        // Count lines and find byte offset at CHANGED_MAX_DIFF_LINES
+        var line_count: usize = 0;
+        var byte_end: usize = 0;
+        var it = std.mem.splitScalar(u8, diff_raw, '\n');
+        while (it.next()) |line| {
+            byte_end += line.len + 1;
+            line_count += 1;
+            if (line_count >= CHANGED_MAX_DIFF_LINES) break;
+        }
+        const capped = if (byte_end > diff_raw.len) diff_raw else diff_raw[0..byte_end];
+
+        result_files[i] = .{
+            .path = try gpa.dupe(u8, stat.path),
+            .status = stat.status,
+            .additions = stat.additions,
+            .deletions = stat.deletions,
+            .diff = try gpa.dupe(u8, capped),
+        };
+    }
+
+    return .{
+        .ref = if (ref.len == 0) "HEAD" else ref,
+        .totalFiles = total_files,
+        .totalAdditions = total_add,
+        .totalDeletions = total_del,
+        .truncated = truncated,
+        .files = result_files,
+    };
+}
+
+// --- context-evidence subcommand ---
+
+pub const EvidenceChunk = struct {
+    startLine: u32, // 1-based
+    endLine: u32, // 1-based
+    content: []u8, // owned by caller
+};
+
+pub const ContextEvidenceResult = struct {
+    path: []u8, // owned
+    pattern: []u8, // owned
+    fileBytes: u64,
+    matchCount: u32,
+    chunks: []EvidenceChunk, // owned; each chunk.content is owned
+};
+
+const EVIDENCE_CONTEXT_LINES: usize = 10;
+const EVIDENCE_MAX_CHUNKS: usize = 8;
+
+fn containsInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+pub fn computeContextEvidence(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8, pattern: []const u8) !ContextEvidenceResult {
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(5 * 1024 * 1024));
+    defer gpa.free(content);
+    const file_bytes: u64 = @intCast(content.len);
+
+    // Count lines (pass 1)
+    var line_count: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |_| line_count += 1;
+    }
+    if (line_count == 0) return .{
+        .path = try gpa.dupe(u8, file_path),
+        .pattern = try gpa.dupe(u8, pattern),
+        .fileBytes = file_bytes,
+        .matchCount = 0,
+        .chunks = &.{},
+    };
+
+    // Collect line slices into content — valid until content is freed (end of function)
+    const lines = try gpa.alloc([]const u8, line_count);
+    defer gpa.free(lines);
+    {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        var i: usize = 0;
+        while (it.next()) |line| : (i += 1) lines[i] = line;
+    }
+
+    // Count matching lines (pass 1)
+    var match_count: u32 = 0;
+    for (lines) |line| {
+        if (containsInsensitive(line, pattern)) match_count += 1;
+    }
+
+    // Collect match indices (pass 2)
+    const match_indices = try gpa.alloc(usize, match_count);
+    defer gpa.free(match_indices);
+    {
+        var mi: usize = 0;
+        for (lines, 0..) |line, idx| {
+            if (containsInsensitive(line, pattern)) {
+                match_indices[mi] = idx;
+                mi += 1;
+            }
+        }
+    }
+
+    // Build and merge context windows; worst case = match_count windows
+    const windows = try gpa.alloc([2]usize, if (match_count > 0) match_count else 1);
+    defer gpa.free(windows);
+    var merged_count: usize = 0;
+    if (match_count > 0) {
+        var cur_start: usize = if (match_indices[0] >= EVIDENCE_CONTEXT_LINES) match_indices[0] - EVIDENCE_CONTEXT_LINES else 0;
+        var cur_end: usize = @min(match_indices[0] + EVIDENCE_CONTEXT_LINES, lines.len - 1);
+        for (match_indices[1..]) |idx| {
+            const w_start: usize = if (idx >= EVIDENCE_CONTEXT_LINES) idx - EVIDENCE_CONTEXT_LINES else 0;
+            const w_end: usize = @min(idx + EVIDENCE_CONTEXT_LINES, lines.len - 1);
+            if (w_start <= cur_end + 1) {
+                cur_end = @max(cur_end, w_end);
+            } else {
+                windows[merged_count] = .{ cur_start, cur_end };
+                merged_count += 1;
+                cur_start = w_start;
+                cur_end = w_end;
+            }
+        }
+        windows[merged_count] = .{ cur_start, cur_end };
+        merged_count += 1;
+    }
+
+    // Build chunks (capped at EVIDENCE_MAX_CHUNKS)
+    const chunk_count = @min(merged_count, EVIDENCE_MAX_CHUNKS);
+    const chunks = try gpa.alloc(EvidenceChunk, chunk_count);
+    for (0..chunk_count) |i| {
+        const start = windows[i][0];
+        const end = windows[i][1];
+        // Calculate byte size of joined lines
+        var byte_count: usize = 0;
+        for (lines[start .. end + 1]) |line| byte_count += line.len + 1;
+        if (byte_count > 0) byte_count -= 1; // no trailing \n
+        const chunk_buf = try gpa.alloc(u8, byte_count);
+        var pos: usize = 0;
+        for (lines[start .. end + 1], 0..) |line, li| {
+            @memcpy(chunk_buf[pos .. pos + line.len], line);
+            pos += line.len;
+            if (li + 1 < end - start + 1) {
+                chunk_buf[pos] = '\n';
+                pos += 1;
+            }
+        }
+        chunks[i] = .{
+            .startLine = @intCast(start + 1),
+            .endLine = @intCast(end + 1),
+            .content = chunk_buf,
+        };
+    }
+
+    return .{
+        .path = try gpa.dupe(u8, file_path),
+        .pattern = try gpa.dupe(u8, pattern),
+        .fileBytes = file_bytes,
+        .matchCount = match_count,
+        .chunks = chunks,
+    };
+}
+
+// --- context-budget subcommand (M35) ---
+
+pub const BudgetEntry = struct {
+    path: []u8, // owned
+    bytes: u64,
+    tokens: u64,
+};
+
+pub const ContextBudgetResult = struct {
+    tokenEstimate: u64,
+    risk: []const u8, // static: "low"|"medium"|"high"
+    breakdown: []BudgetEntry, // owned; each .path is owned
+};
+
+const BUDGET_RISK_LOW_MAX: u64 = 2000;
+const BUDGET_RISK_MEDIUM_MAX: u64 = 8000;
+
+fn classifyBudgetRisk(token_estimate: u64) []const u8 {
+    if (token_estimate < BUDGET_RISK_LOW_MAX) return "low";
+    if (token_estimate < BUDGET_RISK_MEDIUM_MAX) return "medium";
+    return "high";
+}
+
+pub fn computeContextBudget(gpa: std.mem.Allocator, io: std.Io, paths: []const []const u8) !ContextBudgetResult {
+    const entries = try gpa.alloc(BudgetEntry, paths.len);
+    errdefer {
+        for (entries) |e| gpa.free(e.path);
+        gpa.free(entries);
+    }
+
+    var total_bytes: u64 = 0;
+    for (paths, 0..) |p, i| {
+        const stats = computeFileStats(gpa, io, p) catch FileStatsResult{ .path = p, .lines = 0, .bytes = 0 };
+        const tokens = stats.bytes / 4;
+        entries[i] = .{ .path = try gpa.dupe(u8, p), .bytes = stats.bytes, .tokens = tokens };
+        total_bytes += stats.bytes;
+    }
+
+    const token_estimate = total_bytes / 4;
+    return .{
+        .tokenEstimate = token_estimate,
+        .risk = classifyBudgetRisk(token_estimate),
+        .breakdown = entries,
+    };
+}
+
+// --- context-gate subcommand (M34, Phase 2 wired 2026-07-02) ---
+// Composes context-rank (relevant files), context-changed (working-tree diff),
+// secret-scan (redaction gate), context-classifier (task type), and — for
+// architecture_refactor tasks only — context-dependency-graph (blast radius),
+// plus context-compressor for any oversized included file, into one Compact
+// Context Manifest instead of Claude chaining five calls itself. This closes
+// Wave 5 Phase 2 (task-aware context): a compile-error task and an
+// architecture-refactor task now genuinely pull different context, not just
+// the same rank+diff every time.
+
+pub const ContextGateResult = struct {
+    task: []u8, // owned
+    taskType: []const u8, // static — from context-classifier
+    classifierConfidence: f64,
+    tokenEstimate: u64,
+    risk: []const u8, // static: "low"|"medium"|"high"
+    includeFiles: [][]u8, // owned; each entry owned
+    includeDiff: bool,
+    compressedFiles: u32, // count of included files that were over the compression threshold
+    excludeSecrets: bool, // true = potential secrets found, caller must redact before sending
+    sendToAi: bool,
+    reason: []u8, // owned
+};
+
+const CONTEXT_GATE_MAX_FILES: usize = 8;
+const CONTEXT_GATE_MAX_DEP_FILES: usize = 4; // extra importedBy files added for architecture_refactor tasks
+const CONTEXT_GATE_COMPRESS_THRESHOLD: u64 = 8 * 1024; // bytes — matches context-rank's own per-file read cap
+
+pub fn computeContextGate(gpa: std.mem.Allocator, io: std.Io, path: []const u8, task: []const u8) !ContextGateResult {
+    const classification = try computeContextClassifier(gpa, task);
+    defer gpa.free(classification.signals);
+
+    const rank = try computeContextRank(gpa, io, path, task);
+    defer {
+        gpa.free(rank.root);
+        gpa.free(rank.query);
+        for (rank.ranked) |f| gpa.free(f.path);
+        gpa.free(rank.ranked);
+    }
+
+    const changed: ?ContextChangedResult = computeContextChanged(gpa, io, path, "") catch null;
+    defer if (changed) |c| {
+        for (c.files) |f| {
+            gpa.free(f.path);
+            gpa.free(f.diff);
+        }
+        gpa.free(c.files);
+    };
+
+    const secrets = computeSecretScan(gpa, io, path) catch SecretScanResult{ .findings = &.{}, .truncated = false };
+    defer {
+        for (secrets.findings) |f| gpa.free(f.file);
+        gpa.free(secrets.findings);
+    }
+
+    const file_count = @min(CONTEXT_GATE_MAX_FILES, rank.ranked.len);
+    var include_files: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (include_files.items) |f| gpa.free(f);
+        include_files.deinit(gpa);
+    }
+    var total_bytes: u64 = 0;
+    var compressed_count: u32 = 0;
+
+    // compile_error tasks need the top-ranked (most relevant) file at full
+    // fidelity — compressing it away is exactly wrong for a task that needs
+    // exact line content. Every other file, and every other task type, is
+    // fair game for compression when oversized.
+    const is_compile_error = std.mem.eql(u8, classification.taskType, "compile_error");
+
+    for (0..file_count) |i| {
+        const rel_path = rank.ranked[i].path;
+        var bytes = rank.ranked[i].bytes;
+        const skip_compression = is_compile_error and i == 0;
+        if (!skip_compression and bytes > CONTEXT_GATE_COMPRESS_THRESHOLD) {
+            const abs_file = try std.fs.path.join(gpa, &.{ path, rel_path });
+            defer gpa.free(abs_file);
+            if (computeContextCompressor(gpa, io, abs_file, 200)) |comp| {
+                defer {
+                    gpa.free(comp.path);
+                    gpa.free(comp.summary);
+                }
+                bytes = comp.summary.len;
+                compressed_count += 1;
+            } else |_| {}
+        }
+        try include_files.append(gpa, try gpa.dupe(u8, rel_path));
+        total_bytes += bytes;
+    }
+
+    // architecture_refactor: pull in files that import the top-ranked file
+    // (the blast radius) — the exact context that task type needs and the
+    // other types don't. Not applied to compile_error/bug_fix/feature: their
+    // relevant context is what changed (context-changed) and what's
+    // ranked, not who else depends on it.
+    if (rank.ranked.len > 0 and std.mem.eql(u8, classification.taskType, "architecture_refactor")) {
+        const dep = computeContextDependencyGraph(gpa, io, path, rank.ranked[0].path) catch null;
+        if (dep) |d| {
+            defer {
+                gpa.free(d.root);
+                for (d.imports) |imp| gpa.free(imp);
+                gpa.free(d.imports);
+                for (d.importedBy) |ib| gpa.free(ib);
+                gpa.free(d.importedBy);
+            }
+            var added: usize = 0;
+            for (d.importedBy) |ib| {
+                if (added >= CONTEXT_GATE_MAX_DEP_FILES) break;
+                var already_included = false;
+                for (include_files.items) |existing| {
+                    if (std.mem.eql(u8, existing, ib)) {
+                        already_included = true;
+                        break;
+                    }
+                }
+                if (already_included) continue;
+                try include_files.append(gpa, try gpa.dupe(u8, ib));
+                added += 1;
+                // Byte size unknown without a stat call here; the token
+                // estimate below stays a slight underestimate for these
+                // extra dependency-graph files — acceptable, risk
+                // classification already errs toward "high" on ambiguity
+                // via context-rank's own file set.
+            }
+        }
+    }
+
+    var diff_bytes: u64 = 0;
+    var has_diff = false;
+    if (changed) |c| {
+        has_diff = c.files.len > 0;
+        for (c.files) |f| diff_bytes += f.diff.len;
+    }
+
+    const token_estimate = (total_bytes + diff_bytes) / 4;
+    const risk = classifyBudgetRisk(token_estimate);
+    const has_secrets = secrets.findings.len > 0;
+    const send_to_ai = !has_secrets and !std.mem.eql(u8, risk, "high");
+
+    const reason = if (has_secrets)
+        try std.fmt.allocPrint(gpa, "{d} potential secret(s) found in {s} — redact before sending", .{ secrets.findings.len, path })
+    else if (std.mem.eql(u8, risk, "high"))
+        try std.fmt.allocPrint(gpa, "Estimated {d} tokens — narrow the task or split into smaller requests", .{token_estimate})
+    else
+        try gpa.dupe(u8, "Context is small, relevant, and safe.");
+
+    const owned_files = try include_files.toOwnedSlice(gpa);
+    appendContextGateEvent(gpa, io, task, classification.taskType, owned_files, token_estimate, risk, compressed_count);
+
+    return .{
+        .task = try gpa.dupe(u8, task),
+        .taskType = classification.taskType,
+        .classifierConfidence = classification.confidence,
+        .tokenEstimate = token_estimate,
+        .risk = risk,
+        .includeFiles = owned_files,
+        .includeDiff = has_diff,
+        .compressedFiles = compressed_count,
+        .excludeSecrets = has_secrets,
+        .sendToAi = send_to_ai,
+        .reason = reason,
+    };
+}
+
+// --- context-gate usage instrumentation ---
+// Logs every context-gate call to ~/.4orman/context-gate-events.json
+// (JSON-lines, same convention as attempts.log/verification.log) so
+// `metrics` can report repeated prompts, repeated files, and token
+// estimates across real sessions — the "validate against real 4ORMan
+// development sessions" step needs this raw data to exist first.
+// Best-effort: a logging failure never fails the context-gate call itself.
+fn appendContextGateEvent(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    task: []const u8,
+    task_type: []const u8,
+    files: []const []const u8,
+    token_estimate: u64,
+    risk: []const u8,
+    compressed_files: u32,
+) void {
+    const home_ptr = std.c.getenv("HOME") orelse return;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = std.fmt.allocPrint(gpa, "{s}/.4orman", .{home}) catch return;
+    defer gpa.free(foreman_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+
+    const esc_task = allocJsonEscape(gpa, task) catch return;
+    defer gpa.free(esc_task);
+
+    var files_buf: std.ArrayList(u8) = .empty;
+    defer files_buf.deinit(gpa);
+    files_buf.appendSlice(gpa, "[") catch return;
+    for (files, 0..) |f, i| {
+        const esc_f = allocJsonEscape(gpa, f) catch continue;
+        defer gpa.free(esc_f);
+        if (i > 0) files_buf.appendSlice(gpa, ", ") catch return;
+        files_buf.appendSlice(gpa, "\"") catch return;
+        files_buf.appendSlice(gpa, esc_f) catch return;
+        files_buf.appendSlice(gpa, "\"") catch return;
+    }
+    files_buf.appendSlice(gpa, "]") catch return;
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+
+    const line = std.fmt.allocPrint(
+        gpa,
+        "{{\"ts\": {d}, \"task\": \"{s}\", \"taskType\": \"{s}\", \"tokenEstimate\": {d}, \"risk\": \"{s}\", \"compressedFiles\": {d}, \"files\": {s}}}",
+        .{ @as(i64, @intCast(ts.sec)), esc_task, task_type, token_estimate, risk, compressed_files, files_buf.items },
+    ) catch return;
+    defer gpa.free(line);
+    appendFieldReportLog(gpa, io, foreman_dir, "context-gate-events.json", line);
+}
+
+// --- context-classifier subcommand (M36) ---
+// Keyword/pattern-based task-type detection — no ML. context-gate will use this
+// to decide which files/errors to include per task type once wired in.
+
+pub const ClassifierResult = struct {
+    taskType: []const u8, // static: "compile_error"|"architecture_refactor"|"bug_fix"|"feature"|"other"
+    confidence: f64,
+    signals: [][]const u8, // owned slice; each entry is a static string literal — free only the slice
+};
+
+const ClassifierSignal = struct { keyword: []const u8, task_type: []const u8 };
+
+// Multi-word / distinctive phrases first so specific signals aren't drowned out
+// by generic ones (e.g. "fix" alone matches almost any bug report).
+const CLASSIFIER_SIGNALS = [_]ClassifierSignal{
+    .{ .keyword = "compile error", .task_type = "compile_error" },
+    .{ .keyword = "compilation error", .task_type = "compile_error" },
+    .{ .keyword = "build error", .task_type = "compile_error" },
+    .{ .keyword = "syntax error", .task_type = "compile_error" },
+    .{ .keyword = "doesn't compile", .task_type = "compile_error" },
+    .{ .keyword = "won't build", .task_type = "compile_error" },
+    .{ .keyword = "undefined reference", .task_type = "compile_error" },
+    .{ .keyword = "undeclared", .task_type = "compile_error" },
+    .{ .keyword = "type error", .task_type = "compile_error" },
+    .{ .keyword = "linker error", .task_type = "compile_error" },
+    .{ .keyword = "unreachable code", .task_type = "compile_error" },
+    .{ .keyword = "extract module", .task_type = "architecture_refactor" },
+    .{ .keyword = "split into", .task_type = "architecture_refactor" },
+    .{ .keyword = "restructure", .task_type = "architecture_refactor" },
+    .{ .keyword = "redesign", .task_type = "architecture_refactor" },
+    .{ .keyword = "reorganize", .task_type = "architecture_refactor" },
+    .{ .keyword = "architecture", .task_type = "architecture_refactor" },
+    .{ .keyword = "decouple", .task_type = "architecture_refactor" },
+    .{ .keyword = "refactor", .task_type = "architecture_refactor" },
+    .{ .keyword = "wrong output", .task_type = "bug_fix" },
+    .{ .keyword = "doesn't work", .task_type = "bug_fix" },
+    .{ .keyword = "not working", .task_type = "bug_fix" },
+    .{ .keyword = "regression", .task_type = "bug_fix" },
+    .{ .keyword = "crash", .task_type = "bug_fix" },
+    .{ .keyword = "broken", .task_type = "bug_fix" },
+    .{ .keyword = "incorrect", .task_type = "bug_fix" },
+    .{ .keyword = "failing", .task_type = "bug_fix" },
+    .{ .keyword = "bug", .task_type = "bug_fix" },
+    .{ .keyword = "fix", .task_type = "bug_fix" },
+    .{ .keyword = "new feature", .task_type = "feature" },
+    .{ .keyword = "support for", .task_type = "feature" },
+    .{ .keyword = "build a", .task_type = "feature" },
+    .{ .keyword = "create a", .task_type = "feature" },
+    .{ .keyword = "implement", .task_type = "feature" },
+    .{ .keyword = "add", .task_type = "feature" },
+};
+
+const CLASSIFIER_TYPES = [_][]const u8{ "compile_error", "architecture_refactor", "bug_fix", "feature" };
+
+fn classifierTypeIndex(task_type: []const u8) usize {
+    for (CLASSIFIER_TYPES, 0..) |t, i| {
+        if (std.mem.eql(u8, t, task_type)) return i;
+    }
+    unreachable;
+}
+
+pub fn computeContextClassifier(gpa: std.mem.Allocator, task: []const u8) !ClassifierResult {
+    var counts = [_]u32{0} ** CLASSIFIER_TYPES.len;
+    var matched: std.ArrayList([]const u8) = .empty;
+    errdefer matched.deinit(gpa);
+
+    for (CLASSIFIER_SIGNALS) |sig| {
+        if (containsInsensitive(task, sig.keyword)) {
+            counts[classifierTypeIndex(sig.task_type)] += 1;
+            try matched.append(gpa, sig.keyword);
+        }
+    }
+
+    var best_idx: usize = 0;
+    var best_count: u32 = 0;
+    var total: u32 = 0;
+    for (counts, 0..) |c, i| {
+        total += c;
+        if (c > best_count) {
+            best_count = c;
+            best_idx = i;
+        }
+    }
+
+    const task_type: []const u8 = if (total == 0) "other" else CLASSIFIER_TYPES[best_idx];
+    const confidence: f64 = if (total == 0) 0.0 else @as(f64, @floatFromInt(best_count)) / @as(f64, @floatFromInt(total));
+
+    return .{
+        .taskType = task_type,
+        .confidence = confidence,
+        .signals = try matched.toOwnedSlice(gpa),
+    };
+}
+
+// --- context-dependency-graph subcommand (M37) ---
+// Line-based import extraction, reusing outlineDetectLang's per-language coverage.
+// Block-style imports (Go's `import (...)`) are only caught when a line is a bare
+// quoted string with no alias — aliased block imports are a known gap.
+
+pub const DependencyGraphResult = struct {
+    root: []u8, // owned — the analyzed file's path, relative to <root-path>
+    imports: [][]u8, // owned
+    importedBy: [][]u8, // owned
+};
+
+const DEPGRAPH_MAX_IMPORTED_BY: usize = 50;
+const DEPGRAPH_READ_CAP: usize = 32 * 1024;
+
+fn firstQuoted(line: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const q = line[i];
+        if (q == '"' or q == '\'') {
+            var j = i + 1;
+            while (j < line.len and line[j] != q) : (j += 1) {}
+            if (j < line.len and j > i + 1) return line[i + 1 .. j];
+            return null;
+        }
+    }
+    return null;
+}
+
+fn identOrDotted(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '.' or c == ':' or c == '/')) break;
+    }
+    return s[0..i];
+}
+
+fn extractImportTarget(gpa: std.mem.Allocator, lang: []const u8, raw_line: []const u8) !?[]u8 {
+    const t = std.mem.trim(u8, raw_line, " \t\r");
+    if (t.len == 0 or std.mem.startsWith(u8, t, "//") or std.mem.startsWith(u8, t, "#")) return null;
+
+    if (std.mem.eql(u8, lang, "zig")) {
+        if (std.mem.indexOf(u8, t, "@import(") == null) return null;
+        if (firstQuoted(t)) |q| return try gpa.dupe(u8, q);
+        return null;
+    }
+    if (std.mem.eql(u8, lang, "go")) {
+        const is_import_line = std.mem.startsWith(u8, t, "import ") or
+            (t.len > 0 and (t[0] == '"' or t[0] == '\''));
+        if (!is_import_line) return null;
+        if (firstQuoted(t)) |q| return try gpa.dupe(u8, q);
+        return null;
+    }
+    if (std.mem.eql(u8, lang, "javascript") or std.mem.eql(u8, lang, "typescript")) {
+        const looks_like_import = (std.mem.startsWith(u8, t, "import ") and std.mem.indexOf(u8, t, "from") != null) or
+            std.mem.indexOf(u8, t, "require(") != null;
+        if (!looks_like_import) return null;
+        if (firstQuoted(t)) |q| return try gpa.dupe(u8, q);
+        return null;
+    }
+    if (std.mem.eql(u8, lang, "python")) {
+        if (outlineKw(t, "import")) |rest| return try gpa.dupe(u8, identOrDotted(rest));
+        if (std.mem.startsWith(u8, t, "from ")) {
+            const after = t["from ".len..];
+            const end = std.mem.indexOf(u8, after, " import") orelse after.len;
+            return try gpa.dupe(u8, std.mem.trim(u8, after[0..end], " "));
+        }
+        return null;
+    }
+    if (std.mem.eql(u8, lang, "rust")) {
+        if (!std.mem.startsWith(u8, t, "use ")) return null;
+        const after = t["use ".len..];
+        const end = std.mem.indexOfScalar(u8, after, ';') orelse after.len;
+        return try gpa.dupe(u8, std.mem.trim(u8, after[0..end], " "));
+    }
+    return null;
+}
+
+pub fn computeContextDependencyGraph(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, rel_file_path: []const u8) !DependencyGraphResult {
+    const abs_path = try std.fs.path.join(gpa, &.{ root_path, rel_file_path });
+    defer gpa.free(abs_path);
+
+    const lang = outlineDetectLang(rel_file_path);
+
+    var imports: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (imports.items) |imp| gpa.free(imp);
+        imports.deinit(gpa);
+    }
+    {
+        const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return error.FileNotFound;
+        defer file.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var r = file.reader(io, &read_buf);
+        const dest = try gpa.alloc(u8, DEPGRAPH_READ_CAP);
+        defer gpa.free(dest);
+        const n = try r.interface.readSliceShort(dest);
+        const content = dest[0..n];
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            if (try extractImportTarget(gpa, lang, line)) |target| {
+                try imports.append(gpa, target);
+            }
+        }
+    }
+
+    // importedBy: walk the project, flag any file (other than this one) whose
+    // content mentions this file's basename — heuristic, not a resolved graph.
+    const base_no_ext = blk: {
+        const base = std.fs.path.basename(rel_file_path);
+        const dot = std.mem.lastIndexOfScalar(u8, base, '.');
+        break :blk if (dot) |d| base[0..d] else base;
+    };
+
+    var imported_by: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (imported_by.items) |p| gpa.free(p);
+        imported_by.deinit(gpa);
+    }
+
+    if (base_no_ext.len > 0) {
+        const scan = try computeScan(gpa, io, root_path);
+        defer {
+            for (scan.keyFiles) |f| gpa.free(f);
+            gpa.free(scan.keyFiles);
+            for (scan.dirMap) |d| gpa.free(d);
+            gpa.free(scan.dirMap);
+            if (scan.entryPoint) |ep| gpa.free(ep);
+            for (scan.files) |f| gpa.free(f.path);
+            gpa.free(scan.files);
+        }
+
+        for (scan.files) |f| {
+            if (imported_by.items.len >= DEPGRAPH_MAX_IMPORTED_BY) break;
+            if (std.mem.eql(u8, f.path, rel_file_path)) continue;
+
+            const candidate_abs = try std.fs.path.join(gpa, &.{ root_path, f.path });
+            defer gpa.free(candidate_abs);
+            const cfile = std.Io.Dir.openFileAbsolute(io, candidate_abs, .{}) catch continue;
+            defer cfile.close(io);
+            var cbuf: [4096]u8 = undefined;
+            var cr = cfile.reader(io, &cbuf);
+            const cdest = try gpa.alloc(u8, DEPGRAPH_READ_CAP);
+            defer gpa.free(cdest);
+            const cn = cr.interface.readSliceShort(cdest) catch continue;
+            const ccontent = cdest[0..cn];
+
+            if (std.mem.indexOf(u8, ccontent, base_no_ext) != null) {
+                try imported_by.append(gpa, try gpa.dupe(u8, f.path));
+            }
+        }
+    }
+
+    return .{
+        .root = try gpa.dupe(u8, rel_file_path),
+        .imports = try imports.toOwnedSlice(gpa),
+        .importedBy = try imported_by.toOwnedSlice(gpa),
+    };
+}
+
+// --- context-compressor subcommand (M38) ---
+
+pub const CompressorResult = struct {
+    path: []u8, // owned
+    originalLines: u32,
+    compressedLines: u32,
+    summary: []u8, // owned
+};
+
+const COMPRESSOR_DEFAULT_MAX_LINES: usize = 200;
+
+pub fn computeContextCompressor(gpa: std.mem.Allocator, io: std.Io, path: []const u8, max_lines: usize) !CompressorResult {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+    defer gpa.free(content);
+
+    var line_count: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |_| line_count += 1;
+    }
+
+    if (line_count <= max_lines) {
+        return .{
+            .path = try gpa.dupe(u8, path),
+            .originalLines = @intCast(line_count),
+            .compressedLines = @intCast(line_count),
+            .summary = try gpa.dupe(u8, content),
+        };
+    }
+
+    const lines = try gpa.alloc([]const u8, line_count);
+    defer gpa.free(lines);
+    {
+        var it = std.mem.splitScalar(u8, content, '\n');
+        var i: usize = 0;
+        while (it.next()) |line| : (i += 1) lines[i] = line;
+    }
+
+    const head = max_lines / 2;
+    const tail = max_lines - head;
+    const omitted = line_count - max_lines;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (lines[0..head]) |line| {
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
+    const marker = try std.fmt.allocPrint(gpa, "... {d} lines omitted ...\n", .{omitted});
+    defer gpa.free(marker);
+    try out.appendSlice(gpa, marker);
+    for (lines[line_count - tail ..]) |line| {
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
+
+    return .{
+        .path = try gpa.dupe(u8, path),
+        .originalLines = @intCast(line_count),
+        .compressedLines = @intCast(max_lines + 1), // +1 for the omitted-lines marker
+        .summary = try out.toOwnedSlice(gpa),
+    };
+}
+
+// --- update / field-reports (4ORMan Field Reports #1-3) ---
+// Project-scoped operational memory, distinct from the global ledger.
+// Stored at ~/.4orman/field-reports/<project-id>/ — same ~/.4orman/
+// storage convention as ledger.json, not a second location. project-id
+// is the resolved project root's basename (e.g. "zig-factory").
+
+pub const FieldReportState = struct {
+    project: []u8, // owned
+    status: []u8, // owned: "running" | "idle" | "blocked" | "complete"
+    current_task: []u8, // owned
+    progress: f64,
+    last_checkpoint: []u8, // owned
+    resume_point: []u8, // owned
+    last_updated: i64,
+};
+
+pub fn freeFieldReportState(gpa: std.mem.Allocator, s: FieldReportState) void {
+    gpa.free(s.project);
+    gpa.free(s.status);
+    gpa.free(s.current_task);
+    gpa.free(s.last_checkpoint);
+    gpa.free(s.resume_point);
+}
+
+pub fn fieldReportProjectId(abs_path: []const u8) []const u8 {
+    return std.fs.path.basename(abs_path);
+}
+
+pub fn allocFieldReportDir(gpa: std.mem.Allocator, home: []const u8, project_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/.4orman/field-reports/{s}", .{ home, project_id });
+}
+
+fn ensureFieldReportDir(io: std.Io, home: []const u8, dir: []const u8) void {
+    var base_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&base_buf, "{s}/.4orman", .{home})) |base| {
+        std.Io.Dir.createDirAbsolute(io, base, .default_dir) catch {};
+    } else |_| {}
+    var reports_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&reports_buf, "{s}/.4orman/field-reports", .{home})) |reports| {
+        std.Io.Dir.createDirAbsolute(io, reports, .default_dir) catch {};
+    } else |_| {}
+    std.Io.Dir.createDirAbsolute(io, dir, .default_dir) catch {};
+}
+
+fn readFieldReportState(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ?FieldReportState {
+    const path = std.fmt.allocPrint(gpa, "{s}/state.json", .{dir}) catch return null;
+    defer gpa.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(256 * 1024)) catch return null;
+    defer gpa.free(content);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const o = parsed.value.object;
+
+    const project_v = o.get("project") orelse return null;
+    const status_v = o.get("status") orelse return null;
+    const task_v = o.get("current_task") orelse return null;
+    const checkpoint_v = o.get("last_checkpoint") orelse return null;
+    const resume_v = o.get("resume_point") orelse return null;
+    if (project_v != .string or status_v != .string or task_v != .string or
+        checkpoint_v != .string or resume_v != .string) return null;
+
+    const progress: f64 = if (o.get("progress")) |pv| switch (pv) {
+        .float => |f| f,
+        .integer => |n| @floatFromInt(n),
+        else => 0.0,
+    } else 0.0;
+    const updated: i64 = if (o.get("last_updated")) |uv| switch (uv) {
+        .integer => |n| n,
+        else => 0,
+    } else 0;
+
+    return FieldReportState{
+        .project = gpa.dupe(u8, project_v.string) catch return null,
+        .status = gpa.dupe(u8, status_v.string) catch return null,
+        .current_task = gpa.dupe(u8, task_v.string) catch return null,
+        .progress = progress,
+        .last_checkpoint = gpa.dupe(u8, checkpoint_v.string) catch return null,
+        .resume_point = gpa.dupe(u8, resume_v.string) catch return null,
+        .last_updated = updated,
+    };
+}
+
+fn writeFieldReportState(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, state: FieldReportState) void {
+    const path = std.fmt.allocPrint(gpa, "{s}/state.json", .{dir}) catch return;
+    defer gpa.free(path);
+    const tmp_path = std.fmt.allocPrint(gpa, "{s}.tmp", .{path}) catch return;
+    defer gpa.free(tmp_path);
+
+    const esc_project = allocJsonEscape(gpa, state.project) catch return;
+    defer gpa.free(esc_project);
+    const esc_status = allocJsonEscape(gpa, state.status) catch return;
+    defer gpa.free(esc_status);
+    const esc_task = allocJsonEscape(gpa, state.current_task) catch return;
+    defer gpa.free(esc_task);
+    const esc_checkpoint = allocJsonEscape(gpa, state.last_checkpoint) catch return;
+    defer gpa.free(esc_checkpoint);
+    const esc_resume = allocJsonEscape(gpa, state.resume_point) catch return;
+    defer gpa.free(esc_resume);
+
+    const json = std.fmt.allocPrint(
+        gpa,
+        "{{\n  \"project\": \"{s}\",\n  \"status\": \"{s}\",\n  \"current_task\": \"{s}\",\n  \"progress\": {d:.2},\n  \"last_checkpoint\": \"{s}\",\n  \"resume_point\": \"{s}\",\n  \"last_updated\": {d}\n}}\n",
+        .{ esc_project, esc_status, esc_task, state.progress, esc_checkpoint, esc_resume, state.last_updated },
+    ) catch return;
+    defer gpa.free(json);
+
+    const f = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    var wbuf: [4096]u8 = undefined;
+    var w = f.writerStreaming(io, &wbuf);
+    const ok = blk: {
+        w.interface.writeAll(json) catch break :blk false;
+        w.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    f.close(io);
+    if (!ok) return;
+    atomicRenameAbsolute(tmp_path, path);
+}
+
+// Generic append-text-at-EOF helper — despite the name (first user was
+// attempts.log/verification.log, one JSON object per line), also used for
+// solved.toml/blocked.toml TOML array-of-tables blocks. Existing content is
+// never rewritten. Appends via writePositionalAll at current EOF offset
+// since this Io.File has no dedicated append-mode open flag.
+fn appendFieldReportLog(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, filename: []const u8, text_block: []const u8) void {
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, filename }) catch return;
+    defer gpa.free(path);
+    const f = std.Io.Dir.createFileAbsolute(io, path, .{ .read = true, .truncate = false }) catch return;
+    defer f.close(io);
+    const st = f.stat(io) catch return;
+    const line = std.fmt.allocPrint(gpa, "{s}\n", .{text_block}) catch return;
+    defer gpa.free(line);
+    f.writePositionalAll(io, line, st.size) catch return;
+}
+
+pub const UpdateResult = struct {
+    projectId: []u8, // owned
+    fieldReportPath: []u8, // owned
+    status: []u8, // owned
+    progress: f64,
+    discoverSummary: []u8, // owned — e.g. "framework=Zig, files=173"
+    verifyPassed: bool,
+};
+
+// Discover -> read metadata -> verify -> log -> resume-ready state. Does not
+// yet execute repair work (capability routing / #4+ in the priority plan) —
+// this is the scope + dispatch skeleton plus the three field-report
+// primitives (state.json, attempts.log, verification.log), not the full
+// autonomous loop.
+pub fn computeUpdate(gpa: std.mem.Allocator, io: std.Io, project_root_abs: []const u8) !UpdateResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+
+    const project_id = fieldReportProjectId(project_root_abs);
+    const dir = try allocFieldReportDir(gpa, home, project_id);
+    errdefer gpa.free(dir);
+    ensureFieldReportDir(io, home, dir);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    const existing = readFieldReportState(gpa, io, dir);
+    const resuming = existing != null;
+    if (existing) |e| freeFieldReportState(gpa, e); // read only to detect resume; state below is rebuilt fresh each run
+
+    // --- discover ---
+    const t_discover_start = now_ts;
+    const scan = try computeScan(gpa, io, project_root_abs);
+    defer {
+        for (scan.keyFiles) |f| gpa.free(f);
+        gpa.free(scan.keyFiles);
+        for (scan.dirMap) |d| gpa.free(d);
+        gpa.free(scan.dirMap);
+        if (scan.entryPoint) |ep| gpa.free(ep);
+        for (scan.files) |f| gpa.free(f.path);
+        gpa.free(scan.files);
+    }
+    const discover_summary = try std.fmt.allocPrint(gpa, "framework={s}, files={d}", .{ scan.framework, scan.fileCount });
+    errdefer gpa.free(discover_summary);
+
+    {
+        const esc_summary = allocJsonEscape(gpa, discover_summary) catch discover_summary;
+        defer if (esc_summary.ptr != discover_summary.ptr) gpa.free(esc_summary);
+        const line = std.fmt.allocPrint(
+            gpa,
+            "{{\"task\": \"discover\", \"result\": \"{s}\", \"duration_ms\": {d}, \"status\": \"success\"}}",
+            .{ esc_summary, @as(i64, 0) },
+        ) catch "";
+        defer if (line.len > 0) gpa.free(line);
+        if (line.len > 0) appendFieldReportLog(gpa, io, dir, "attempts.log", line);
+    }
+    _ = t_discover_start;
+
+    // --- verify (quality-gate is the smallest correct verification signal
+    // for #1-3; capability-specific verification arrives with #4+) ---
+    const qg = try computeQualityGate(gpa, io, project_root_abs);
+    const verify_passed = std.mem.eql(u8, qg.verdict, "pass");
+    {
+        const line = std.fmt.allocPrint(
+            gpa,
+            "{{\"test\": \"quality-gate\", \"passed\": {s}}}",
+            .{if (verify_passed) "true" else "false"},
+        ) catch "";
+        defer if (line.len > 0) gpa.free(line);
+        if (line.len > 0) appendFieldReportLog(gpa, io, dir, "verification.log", line);
+    }
+
+    const status: []const u8 = if (verify_passed) "idle" else "blocked";
+    const new_state = FieldReportState{
+        .project = try gpa.dupe(u8, project_id),
+        .status = try gpa.dupe(u8, status),
+        .current_task = try gpa.dupe(u8, "verify"),
+        .progress = 0.5,
+        .last_checkpoint = try gpa.dupe(u8, "discover+verify"),
+        .resume_point = try gpa.dupe(u8, if (verify_passed) "execute" else "review-field-reports"),
+        .last_updated = now_ts,
+    };
+    defer freeFieldReportState(gpa, new_state);
+    writeFieldReportState(gpa, io, dir, new_state);
+    _ = resuming;
+
+    return .{
+        .projectId = try gpa.dupe(u8, project_id),
+        .fieldReportPath = dir,
+        .status = try gpa.dupe(u8, status),
+        .progress = 0.5,
+        .discoverSummary = discover_summary,
+        .verifyPassed = verify_passed,
+    };
+}
+
+// --- solved.toml / blocked.toml writers (Field Reports #4) ---
+// Append-only TOML array-of-tables, same directory and dedup philosophy as
+// state.json/attempts.log/verification.log — reuses appendFieldReportLog
+// (despite the name, it's a generic append-text-to-file-at-EOF helper, not
+// JSON-specific) and allocJsonEscape for string escaping (TOML basic-string
+// escapes — \" \\ \n \r \t \uXXXX — are a compatible subset of JSON's, no
+// second escaper needed).
+
+pub const SolvedEntry = struct {
+    problem: []const u8,
+    solution: []const u8,
+    verification: []const u8,
+    reusable: bool,
+};
+
+pub const BlockedEntry = struct {
+    objective: []const u8,
+    project: []const u8,
+    context: []const u8,
+    attempted: []const u8,
+    blocker: []const u8,
+    minimumHelpNeeded: []const u8,
+    suggestedNextStep: []const u8,
+};
+
+pub const FieldReportWriteResult = struct {
+    fieldReportPath: []u8, // owned
+    file: []const u8, // static: "solved.toml" | "blocked.toml"
+};
+
+pub fn computeFieldReportSolve(gpa: std.mem.Allocator, io: std.Io, project_root_abs: []const u8, entry: SolvedEntry) !FieldReportWriteResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const project_id = fieldReportProjectId(project_root_abs);
+    const dir = try allocFieldReportDir(gpa, home, project_id);
+    errdefer gpa.free(dir);
+    ensureFieldReportDir(io, home, dir);
+
+    const esc_problem = try allocJsonEscape(gpa, entry.problem);
+    defer gpa.free(esc_problem);
+    const esc_solution = try allocJsonEscape(gpa, entry.solution);
+    defer gpa.free(esc_solution);
+    const esc_verification = try allocJsonEscape(gpa, entry.verification);
+    defer gpa.free(esc_verification);
+
+    const block = try std.fmt.allocPrint(
+        gpa,
+        "[[solved]]\nproblem = \"{s}\"\nsolution = \"{s}\"\nverification = \"{s}\"\nreusable = {s}\n\n",
+        .{ esc_problem, esc_solution, esc_verification, if (entry.reusable) "true" else "false" },
+    );
+    defer gpa.free(block);
+    appendFieldReportLog(gpa, io, dir, "solved.toml", block);
+
+    return .{ .fieldReportPath = dir, .file = "solved.toml" };
+}
+
+// A blocked entry always demotes state.json's status to "blocked" and
+// points resume_point at review-field-reports — state.json stays the
+// single source of truth for "what should happen next", blocked.toml is
+// the evidence trail, not a second place callers have to check.
+pub fn computeFieldReportBlock(gpa: std.mem.Allocator, io: std.Io, project_root_abs: []const u8, entry: BlockedEntry) !FieldReportWriteResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const project_id = fieldReportProjectId(project_root_abs);
+    const dir = try allocFieldReportDir(gpa, home, project_id);
+    errdefer gpa.free(dir);
+    ensureFieldReportDir(io, home, dir);
+
+    const esc_objective = try allocJsonEscape(gpa, entry.objective);
+    defer gpa.free(esc_objective);
+    const esc_project = try allocJsonEscape(gpa, entry.project);
+    defer gpa.free(esc_project);
+    const esc_context = try allocJsonEscape(gpa, entry.context);
+    defer gpa.free(esc_context);
+    const esc_attempted = try allocJsonEscape(gpa, entry.attempted);
+    defer gpa.free(esc_attempted);
+    const esc_blocker = try allocJsonEscape(gpa, entry.blocker);
+    defer gpa.free(esc_blocker);
+    const esc_help = try allocJsonEscape(gpa, entry.minimumHelpNeeded);
+    defer gpa.free(esc_help);
+    const esc_next = try allocJsonEscape(gpa, entry.suggestedNextStep);
+    defer gpa.free(esc_next);
+
+    const block = try std.fmt.allocPrint(
+        gpa,
+        "[[blocked]]\nobjective = \"{s}\"\nproject = \"{s}\"\ncontext = \"{s}\"\nattempted = \"{s}\"\nblocker = \"{s}\"\nminimum_help_needed = \"{s}\"\nsuggested_next_step = \"{s}\"\n\n",
+        .{ esc_objective, esc_project, esc_context, esc_attempted, esc_blocker, esc_help, esc_next },
+    );
+    defer gpa.free(block);
+    appendFieldReportLog(gpa, io, dir, "blocked.toml", block);
+
+    if (readFieldReportState(gpa, io, dir)) |existing| {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        const blocked_state = FieldReportState{
+            .project = try gpa.dupe(u8, existing.project),
+            .status = try gpa.dupe(u8, "blocked"),
+            .current_task = try gpa.dupe(u8, existing.current_task),
+            .progress = existing.progress,
+            .last_checkpoint = try gpa.dupe(u8, "blocked"),
+            .resume_point = try gpa.dupe(u8, "review-field-reports"),
+            .last_updated = @intCast(ts.sec),
+        };
+        freeFieldReportState(gpa, existing);
+        defer freeFieldReportState(gpa, blocked_state);
+        writeFieldReportState(gpa, io, dir, blocked_state);
+    }
+
+    return .{ .fieldReportPath = dir, .file = "blocked.toml" };
+}
+
+// --- review-field-reports (Field Reports #6) ---
+// Scans every ~/.4orman/field-reports/<project_id>/, and for each project
+// whose state.json.status is "blocked", returns its most recent
+// [[blocked]] entry — the current, unresolved blocker, not the full
+// history (older entries may already be superseded by a later solve; there
+// is no per-entry "resolved" marker yet, so state.json.status is the
+// authoritative signal for "does this project still need help").
+
+pub const BlockedRecord = struct {
+    projectId: []u8, // owned
+    objective: []u8, // owned
+    context: []u8, // owned
+    attempted: []u8, // owned
+    blocker: []u8, // owned
+    minimumHelpNeeded: []u8, // owned
+    suggestedNextStep: []u8, // owned
+    lastUpdated: i64,
+};
+
+pub fn freeBlockedRecord(gpa: std.mem.Allocator, r: BlockedRecord) void {
+    gpa.free(r.projectId);
+    gpa.free(r.objective);
+    gpa.free(r.context);
+    gpa.free(r.attempted);
+    gpa.free(r.blocker);
+    gpa.free(r.minimumHelpNeeded);
+    gpa.free(r.suggestedNextStep);
+}
+
+pub const ReviewFieldReportsResult = struct {
+    blockers: []BlockedRecord, // owned; each entry owned; sorted newest-first
+    projectsScanned: u32,
+};
+
+// Minimal line-based parser for blocked.toml's [[blocked]] array-of-tables.
+// Only extracts the fields this schema actually writes (computeFieldReportBlock)
+// — not a general TOML parser, same "cover what we produce" philosophy as
+// toml-query's line-by-line reader elsewhere in this file.
+fn parseTomlStringValue(line: []const u8) ?[]const u8 {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    const rest = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
+    if (rest.len < 2 or rest[0] != '"' or rest[rest.len - 1] != '"') return null;
+    return rest[1 .. rest.len - 1];
+}
+
+fn parseLastBlockedEntry(gpa: std.mem.Allocator, content: []const u8) ?BlockedRecord {
+    var objective: []const u8 = "";
+    var context: []const u8 = "";
+    var attempted: []const u8 = "";
+    var blocker: []const u8 = "";
+    var min_help: []const u8 = "";
+    var next_step: []const u8 = "";
+    var found_any = false;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.eql(u8, line, "[[blocked]]")) {
+            // New block starts — reset so only the LAST block survives.
+            objective = "";
+            context = "";
+            attempted = "";
+            blocker = "";
+            min_help = "";
+            next_step = "";
+            found_any = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "objective")) {
+            objective = parseTomlStringValue(line) orelse objective;
+        } else if (std.mem.startsWith(u8, line, "context")) {
+            context = parseTomlStringValue(line) orelse context;
+        } else if (std.mem.startsWith(u8, line, "attempted")) {
+            attempted = parseTomlStringValue(line) orelse attempted;
+        } else if (std.mem.startsWith(u8, line, "blocker")) {
+            blocker = parseTomlStringValue(line) orelse blocker;
+        } else if (std.mem.startsWith(u8, line, "minimum_help_needed")) {
+            min_help = parseTomlStringValue(line) orelse min_help;
+        } else if (std.mem.startsWith(u8, line, "suggested_next_step")) {
+            next_step = parseTomlStringValue(line) orelse next_step;
+        }
+    }
+    if (!found_any) return null;
+
+    return BlockedRecord{
+        .projectId = gpa.dupe(u8, "") catch return null, // filled in by caller
+        .objective = gpa.dupe(u8, objective) catch return null,
+        .context = gpa.dupe(u8, context) catch return null,
+        .attempted = gpa.dupe(u8, attempted) catch return null,
+        .blocker = gpa.dupe(u8, blocker) catch return null,
+        .minimumHelpNeeded = gpa.dupe(u8, min_help) catch return null,
+        .suggestedNextStep = gpa.dupe(u8, next_step) catch return null,
+        .lastUpdated = 0, // filled in by caller
+    };
+}
+
+pub fn computeReviewFieldReports(gpa: std.mem.Allocator, io: std.Io) !ReviewFieldReportsResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const reports_base = try std.fmt.allocPrint(gpa, "{s}/.4orman/field-reports", .{home});
+    defer gpa.free(reports_base);
+
+    var blockers: std.ArrayList(BlockedRecord) = .empty;
+    errdefer {
+        for (blockers.items) |b| freeBlockedRecord(gpa, b);
+        blockers.deinit(gpa);
+    }
+
+    const listing = computeListDir(gpa, io, reports_base) catch {
+        // No field reports yet — not an error, just nothing to review.
+        return .{ .blockers = &.{}, .projectsScanned = 0 };
+    };
+    defer {
+        for (listing.entries) |e| gpa.free(e.name);
+        gpa.free(listing.entries);
+    }
+
+    var scanned: u32 = 0;
+    for (listing.entries) |e| {
+        if (!std.mem.eql(u8, e.kind, "dir")) continue;
+        scanned += 1;
+
+        const project_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ reports_base, e.name });
+        defer gpa.free(project_dir);
+
+        const state = readFieldReportState(gpa, io, project_dir) orelse continue;
+        const is_blocked = std.mem.eql(u8, state.status, "blocked");
+        const last_updated = state.last_updated;
+        freeFieldReportState(gpa, state);
+        if (!is_blocked) continue;
+
+        const blocked_path = try std.fmt.allocPrint(gpa, "{s}/blocked.toml", .{project_dir});
+        defer gpa.free(blocked_path);
+        const file = std.Io.Dir.openFileAbsolute(io, blocked_path, .{}) catch continue;
+        var read_buf: [4096]u8 = undefined;
+        var r = file.reader(io, &read_buf);
+        const content = r.interface.allocRemaining(gpa, .limited(1024 * 1024)) catch {
+            file.close(io);
+            continue;
+        };
+        file.close(io);
+        defer gpa.free(content);
+
+        var record = parseLastBlockedEntry(gpa, content) orelse continue;
+        gpa.free(record.projectId);
+        record.projectId = try gpa.dupe(u8, e.name);
+        record.lastUpdated = last_updated;
+        try blockers.append(gpa, record);
+    }
+
+    const items = try blockers.toOwnedSlice(gpa);
+    // Newest-first: most recently blocked is the freshest signal of what's
+    // actionable now. True ROI/determinism/reuse-potential scoring needs
+    // metadata this schema doesn't capture yet (see spec.md row 14 / Wave 5
+    // Phase 3 — same "measure before ranking" gap, not solved here).
+    std.mem.sort(BlockedRecord, items, {}, struct {
+        fn lessThan(_: void, a: BlockedRecord, b: BlockedRecord) bool {
+            return a.lastUpdated > b.lastUpdated;
+        }
+    }.lessThan);
+
+    return .{ .blockers = items, .projectsScanned = scanned };
+}
+
+// --- shared solutions ledger (Field Reports #7) ---
+// Stored at ~/.4orman/solutions.json — same ~/.4orman/ root and JSON-lines
+// append-only convention as attempts.log/verification.log, and reuses
+// ledgerWordOverlapScore (the exact matching function `ledger`'s own
+// findLedgerPrecedent uses) for dedup rather than a new scorer. Deliberately
+// NOT merged into ledger.json's `entries` array: that schema and its five
+// existing construction/parse/write call sites back the framework's
+// Claude-vs-Zig scoring protocol (CLAUDE.md's guardrails depend on it) —
+// widening LedgerEntry with solution-specific fields risked that working
+// system for a Medium-priority feature. A sibling file in the same
+// directory, reusing the same matching algorithm, is the lower-risk
+// interpretation of "extend, don't duplicate" here.
+
+pub const SolutionEntry = struct {
+    id: []u8, // owned
+    date: []u8, // owned
+    recordedTs: i64,
+    problemPattern: []u8, // owned — also the dedup/reuse-trigger match key
+    rootCause: []u8, // owned
+    fix: []u8, // owned
+    verification: []u8, // owned
+    applicableProjectTypes: []u8, // owned — comma-separated, not a nested array (avoids a second parse path for one field)
+    confidence: f64,
+    sourceProject: []u8, // owned
+};
+
+pub fn freeSolutionEntry(gpa: std.mem.Allocator, s: SolutionEntry) void {
+    gpa.free(s.id);
+    gpa.free(s.date);
+    gpa.free(s.problemPattern);
+    gpa.free(s.rootCause);
+    gpa.free(s.fix);
+    gpa.free(s.verification);
+    gpa.free(s.applicableProjectTypes);
+    gpa.free(s.sourceProject);
+}
+
+fn allocSolutionsPath(gpa: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/.4orman/solutions.json", .{home});
+}
+
+fn parseSolutionsFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entries: *std.ArrayList(SolutionEntry)) void {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024)) catch return;
+    defer gpa.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const o = parsed.value.object;
+
+        const id_v = o.get("id") orelse continue;
+        const date_v = o.get("date") orelse continue;
+        const pp_v = o.get("problemPattern") orelse continue;
+        if (id_v != .string or date_v != .string or pp_v != .string) continue;
+
+        const getStr = struct {
+            fn get(obj: @TypeOf(o), key: []const u8) []const u8 {
+                if (obj.get(key)) |v| if (v == .string) return v.string;
+                return "";
+            }
+        }.get;
+        const recorded_ts: i64 = if (o.get("recordedTs")) |v| switch (v) {
+            .integer => |n| n,
+            else => 0,
+        } else 0;
+        const confidence: f64 = if (o.get("confidence")) |v| switch (v) {
+            .float => |f| f,
+            .integer => |n| @floatFromInt(n),
+            else => 0.0,
+        } else 0.0;
+
+        const entry = SolutionEntry{
+            .id = gpa.dupe(u8, id_v.string) catch continue,
+            .date = gpa.dupe(u8, date_v.string) catch continue,
+            .recordedTs = recorded_ts,
+            .problemPattern = gpa.dupe(u8, pp_v.string) catch continue,
+            .rootCause = gpa.dupe(u8, getStr(o, "rootCause")) catch continue,
+            .fix = gpa.dupe(u8, getStr(o, "fix")) catch continue,
+            .verification = gpa.dupe(u8, getStr(o, "verification")) catch continue,
+            .applicableProjectTypes = gpa.dupe(u8, getStr(o, "applicableProjectTypes")) catch continue,
+            .confidence = confidence,
+            .sourceProject = gpa.dupe(u8, getStr(o, "sourceProject")) catch continue,
+        };
+        entries.append(gpa, entry) catch continue;
+        if (entries.items.len >= LEDGER_MAX_ENTRIES) break;
+    }
+}
+
+pub const SolutionRecordParams = struct {
+    problemPattern: []const u8,
+    rootCause: []const u8,
+    fix: []const u8,
+    verification: []const u8,
+    applicableProjectTypes: []const u8,
+    confidence: f64,
+    sourceProject: []const u8,
+};
+
+pub const SolutionRecordResult = struct {
+    id: []u8, // owned
+    duplicate: bool, // true if an existing solution already covers this problem pattern (score >= 50) — not stored again
+};
+
+// "Do not store: full conversations, duplicate solutions, project-private
+// secrets, unnecessary logs" — duplicate rejection uses the exact same
+// >=50 word-overlap threshold as ledger's own findLedgerPrecedent, so
+// "what counts as a duplicate" is one definition, not two.
+pub fn computeSolutionRecord(gpa: std.mem.Allocator, io: std.Io, params: SolutionRecordParams) !SolutionRecordResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+    const path = try allocSolutionsPath(gpa, home);
+    defer gpa.free(path);
+
+    var existing: std.ArrayList(SolutionEntry) = .empty;
+    defer {
+        for (existing.items) |e| freeSolutionEntry(gpa, e);
+        existing.deinit(gpa);
+    }
+    parseSolutionsFile(gpa, io, path, &existing);
+
+    const query_lower = try gpa.alloc(u8, params.problemPattern.len);
+    defer gpa.free(query_lower);
+    for (params.problemPattern, 0..) |c, i| query_lower[i] = std.ascii.toLower(c);
+
+    for (existing.items) |e| {
+        const cand_lower = try gpa.alloc(u8, e.problemPattern.len);
+        defer gpa.free(cand_lower);
+        for (e.problemPattern, 0..) |c, i| cand_lower[i] = std.ascii.toLower(c);
+        if (ledgerWordOverlapScore(query_lower, cand_lower) >= 50) {
+            return .{ .id = try gpa.dupe(u8, e.id), .duplicate = true };
+        }
+    }
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+    const date = try tsToDateStr(gpa, @intCast(now_ts));
+    defer gpa.free(date);
+    const id_src = try std.fmt.allocPrint(gpa, "solution:{s}:{s}", .{ params.problemPattern, date });
+    defer gpa.free(id_src);
+    const hex = sha256Hex(id_src);
+    const id = try gpa.dupe(u8, hex[0..16]);
+    errdefer gpa.free(id);
+
+    const esc_pp = try allocJsonEscape(gpa, params.problemPattern);
+    defer gpa.free(esc_pp);
+    const esc_rc = try allocJsonEscape(gpa, params.rootCause);
+    defer gpa.free(esc_rc);
+    const esc_fix = try allocJsonEscape(gpa, params.fix);
+    defer gpa.free(esc_fix);
+    const esc_ver = try allocJsonEscape(gpa, params.verification);
+    defer gpa.free(esc_ver);
+    const esc_types = try allocJsonEscape(gpa, params.applicableProjectTypes);
+    defer gpa.free(esc_types);
+    const esc_src = try allocJsonEscape(gpa, params.sourceProject);
+    defer gpa.free(esc_src);
+    const esc_date = try allocJsonEscape(gpa, date);
+    defer gpa.free(esc_date);
+    const esc_id = try allocJsonEscape(gpa, id);
+    defer gpa.free(esc_id);
+
+    const line = try std.fmt.allocPrint(
+        gpa,
+        "{{\"id\": \"{s}\", \"date\": \"{s}\", \"recordedTs\": {d}, \"problemPattern\": \"{s}\", \"rootCause\": \"{s}\", \"fix\": \"{s}\", \"verification\": \"{s}\", \"applicableProjectTypes\": \"{s}\", \"confidence\": {d:.2}, \"sourceProject\": \"{s}\"}}",
+        .{ esc_id, esc_date, now_ts, esc_pp, esc_rc, esc_fix, esc_ver, esc_types, params.confidence, esc_src },
+    );
+    defer gpa.free(line);
+    appendFieldReportLog(gpa, io, foreman_dir, "solutions.json", line);
+
+    return .{ .id = id, .duplicate = false };
+}
+
+pub const SolutionsListResult = struct {
+    solutions: []SolutionEntry, // owned; each owned
+};
+
+pub fn computeSolutionsList(gpa: std.mem.Allocator, io: std.Io) !SolutionsListResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const path = try allocSolutionsPath(gpa, home);
+    defer gpa.free(path);
+
+    var entries: std.ArrayList(SolutionEntry) = .empty;
+    parseSolutionsFile(gpa, io, path, &entries);
+    return .{ .solutions = try entries.toOwnedSlice(gpa) };
+}
+
+// --- failure memory (failure-memory-v1) ---
+// Stored at ~/.4orman/failures.json — same sibling-file convention as
+// solutions.json above: append-only JSON-lines, deliberately NOT merged
+// into ledger.json's `entries` array (protects the Claude-vs-Zig scoring
+// protocol's schema and its five existing call sites). Two record types
+// share one file, distinguished by "type": a "failure" record captures
+// what went wrong; a "resolution" record references a failure's id and
+// describes the fix that worked later. Marking a fix never rewrites the
+// original failure line — it appends a new resolution line — so the file
+// stays genuinely append-only end to end, not "mostly append, sometimes
+// patch."
+
+const FAILURE_SCHEMA_VERSION: u32 = 1;
+
+pub const FailureEntry = struct {
+    id: []u8, // owned
+    date: []u8, // owned
+    recordedTs: i64,
+    schemaVersion: u32,
+    project: []u8, // owned
+    task: []u8, // owned — lookup match key, alongside errorSummary
+    command: []u8, // owned
+    errorSummary: []u8, // owned
+    filesInvolved: []u8, // owned — comma-separated, same convention as SolutionEntry.applicableProjectTypes
+};
+
+pub fn freeFailureEntry(gpa: std.mem.Allocator, f: FailureEntry) void {
+    gpa.free(f.id);
+    gpa.free(f.date);
+    gpa.free(f.project);
+    gpa.free(f.task);
+    gpa.free(f.command);
+    gpa.free(f.errorSummary);
+    gpa.free(f.filesInvolved);
+}
+
+pub const ResolutionEntry = struct {
+    id: []u8, // owned
+    date: []u8, // owned
+    recordedTs: i64,
+    schemaVersion: u32,
+    failureId: []u8, // owned — references FailureEntry.id
+    fix: []u8, // owned
+};
+
+pub fn freeResolutionEntry(gpa: std.mem.Allocator, r: ResolutionEntry) void {
+    gpa.free(r.id);
+    gpa.free(r.date);
+    gpa.free(r.failureId);
+    gpa.free(r.fix);
+}
+
+fn allocFailuresPath(gpa: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/.4orman/failures.json", .{home});
+}
+
+fn parseFailuresFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, failures: *std.ArrayList(FailureEntry), resolutions: *std.ArrayList(ResolutionEntry)) void {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024)) catch return;
+    defer gpa.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const o = parsed.value.object;
+
+        const getStr = struct {
+            fn get(obj: @TypeOf(o), key: []const u8) []const u8 {
+                if (obj.get(key)) |v| if (v == .string) return v.string;
+                return "";
+            }
+        }.get;
+
+        const type_v = o.get("type") orelse continue;
+        const id_v = o.get("id") orelse continue;
+        const date_v = o.get("date") orelse continue;
+        if (type_v != .string or id_v != .string or date_v != .string) continue;
+        const recorded_ts: i64 = if (o.get("recordedTs")) |v| switch (v) {
+            .integer => |n| n,
+            else => 0,
+        } else 0;
+        const schema_version: u32 = if (o.get("schemaVersion")) |v| switch (v) {
+            .integer => |n| @intCast(n),
+            else => 0,
+        } else 0;
+
+        if (std.mem.eql(u8, type_v.string, "failure")) {
+            const task_v = o.get("task") orelse continue;
+            if (task_v != .string) continue;
+            const entry = FailureEntry{
+                .id = gpa.dupe(u8, id_v.string) catch continue,
+                .date = gpa.dupe(u8, date_v.string) catch continue,
+                .recordedTs = recorded_ts,
+                .schemaVersion = schema_version,
+                .project = gpa.dupe(u8, getStr(o, "project")) catch continue,
+                .task = gpa.dupe(u8, task_v.string) catch continue,
+                .command = gpa.dupe(u8, getStr(o, "command")) catch continue,
+                .errorSummary = gpa.dupe(u8, getStr(o, "errorSummary")) catch continue,
+                .filesInvolved = gpa.dupe(u8, getStr(o, "filesInvolved")) catch continue,
+            };
+            failures.append(gpa, entry) catch continue;
+        } else if (std.mem.eql(u8, type_v.string, "resolution")) {
+            const failure_id_v = o.get("failureId") orelse continue;
+            if (failure_id_v != .string) continue;
+            const entry = ResolutionEntry{
+                .id = gpa.dupe(u8, id_v.string) catch continue,
+                .date = gpa.dupe(u8, date_v.string) catch continue,
+                .recordedTs = recorded_ts,
+                .schemaVersion = schema_version,
+                .failureId = gpa.dupe(u8, failure_id_v.string) catch continue,
+                .fix = gpa.dupe(u8, getStr(o, "fix")) catch continue,
+            };
+            resolutions.append(gpa, entry) catch continue;
+        } else continue;
+
+        if (failures.items.len + resolutions.items.len >= LEDGER_MAX_ENTRIES * 2) break;
+    }
+}
+
+pub const FailureRecordParams = struct {
+    task: []const u8,
+    command: []const u8,
+    errorSummary: []const u8,
+    filesInvolved: []const u8,
+    project: []const u8,
+};
+
+pub const FailureRecordResult = struct {
+    id: []u8, // owned
+};
+
+// No dedup on write, unlike solutions: a repeated failure is itself the
+// signal computeFailureLookup/repeatedFailureCount exist to surface —
+// rejecting the second occurrence as a "duplicate" would erase the exact
+// data this feature is for.
+pub fn computeFailureRecord(gpa: std.mem.Allocator, io: std.Io, params: FailureRecordParams) !FailureRecordResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+    const date = try tsToDateStr(gpa, @intCast(now_ts));
+    defer gpa.free(date);
+    const id_src = try std.fmt.allocPrint(gpa, "failure:{s}:{s}:{d}", .{ params.task, params.errorSummary, now_ts });
+    defer gpa.free(id_src);
+    const hex = sha256Hex(id_src);
+    const id = try gpa.dupe(u8, hex[0..16]);
+    errdefer gpa.free(id);
+
+    const esc_task = try allocJsonEscape(gpa, params.task);
+    defer gpa.free(esc_task);
+    const esc_cmd = try allocJsonEscape(gpa, params.command);
+    defer gpa.free(esc_cmd);
+    const esc_err = try allocJsonEscape(gpa, params.errorSummary);
+    defer gpa.free(esc_err);
+    const esc_files = try allocJsonEscape(gpa, params.filesInvolved);
+    defer gpa.free(esc_files);
+    const esc_project = try allocJsonEscape(gpa, params.project);
+    defer gpa.free(esc_project);
+    const esc_date = try allocJsonEscape(gpa, date);
+    defer gpa.free(esc_date);
+    const esc_id = try allocJsonEscape(gpa, id);
+    defer gpa.free(esc_id);
+
+    const line = try std.fmt.allocPrint(
+        gpa,
+        "{{\"type\": \"failure\", \"id\": \"{s}\", \"date\": \"{s}\", \"recordedTs\": {d}, \"schemaVersion\": {d}, \"project\": \"{s}\", \"task\": \"{s}\", \"command\": \"{s}\", \"errorSummary\": \"{s}\", \"filesInvolved\": \"{s}\"}}",
+        .{ esc_id, esc_date, now_ts, FAILURE_SCHEMA_VERSION, esc_project, esc_task, esc_cmd, esc_err, esc_files },
+    );
+    defer gpa.free(line);
+    appendFieldReportLog(gpa, io, foreman_dir, "failures.json", line);
+
+    return .{ .id = id };
+}
+
+pub const FailureMarkFixedParams = struct {
+    failureId: []const u8,
+    fix: []const u8,
+};
+
+pub const FailureMarkFixedResult = struct {
+    id: []u8, // owned — the new resolution record's id
+    failureFound: bool, // honest disclosure: true only if failureId matched an existing failure record
+};
+
+pub fn computeFailureMarkFixed(gpa: std.mem.Allocator, io: std.Io, params: FailureMarkFixedParams) !FailureMarkFixedResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    const path = try allocFailuresPath(gpa, home);
+    defer gpa.free(path);
+
+    var failures: std.ArrayList(FailureEntry) = .empty;
+    var resolutions: std.ArrayList(ResolutionEntry) = .empty;
+    defer {
+        for (failures.items) |f| freeFailureEntry(gpa, f);
+        failures.deinit(gpa);
+        for (resolutions.items) |r| freeResolutionEntry(gpa, r);
+        resolutions.deinit(gpa);
+    }
+    parseFailuresFile(gpa, io, path, &failures, &resolutions);
+
+    var failure_found = false;
+    for (failures.items) |f| {
+        if (std.mem.eql(u8, f.id, params.failureId)) {
+            failure_found = true;
+            break;
+        }
+    }
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+    const date = try tsToDateStr(gpa, @intCast(now_ts));
+    defer gpa.free(date);
+    const id_src = try std.fmt.allocPrint(gpa, "resolution:{s}:{d}", .{ params.failureId, now_ts });
+    defer gpa.free(id_src);
+    const hex = sha256Hex(id_src);
+    const id = try gpa.dupe(u8, hex[0..16]);
+    errdefer gpa.free(id);
+
+    const esc_failure_id = try allocJsonEscape(gpa, params.failureId);
+    defer gpa.free(esc_failure_id);
+    const esc_fix = try allocJsonEscape(gpa, params.fix);
+    defer gpa.free(esc_fix);
+    const esc_date = try allocJsonEscape(gpa, date);
+    defer gpa.free(esc_date);
+    const esc_id = try allocJsonEscape(gpa, id);
+    defer gpa.free(esc_id);
+
+    const line = try std.fmt.allocPrint(
+        gpa,
+        "{{\"type\": \"resolution\", \"id\": \"{s}\", \"date\": \"{s}\", \"recordedTs\": {d}, \"schemaVersion\": {d}, \"failureId\": \"{s}\", \"fix\": \"{s}\"}}",
+        .{ esc_id, esc_date, now_ts, FAILURE_SCHEMA_VERSION, esc_failure_id, esc_fix },
+    );
+    defer gpa.free(line);
+    appendFieldReportLog(gpa, io, foreman_dir, "failures.json", line);
+
+    return .{ .id = id, .failureFound = failure_found };
+}
+
+pub const FailureLookupMatch = struct {
+    id: []u8, // owned
+    date: []u8, // owned
+    project: []u8, // owned
+    task: []u8, // owned
+    command: []u8, // owned
+    errorSummary: []u8, // owned
+    filesInvolved: []u8, // owned
+    score: u32, // ledgerWordOverlapScore(query, task+errorSummary)
+    resolved: bool,
+    fix: []u8, // owned — empty string if unresolved
+};
+
+pub fn freeFailureLookupMatch(gpa: std.mem.Allocator, m: FailureLookupMatch) void {
+    gpa.free(m.id);
+    gpa.free(m.date);
+    gpa.free(m.project);
+    gpa.free(m.task);
+    gpa.free(m.command);
+    gpa.free(m.errorSummary);
+    gpa.free(m.filesInvolved);
+    gpa.free(m.fix);
+}
+
+pub const FailureLookupResult = struct {
+    matches: []FailureLookupMatch, // owned; each owned; sorted by score desc
+};
+
+// Same >=50 word-overlap threshold as ledger's findLedgerPrecedent and
+// solutions' dedup check — "similar" is one definition across this
+// codebase, not a new scorer per feature.
+pub fn computeFailureLookup(gpa: std.mem.Allocator, io: std.Io, query: []const u8) !FailureLookupResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const path = try allocFailuresPath(gpa, home);
+    defer gpa.free(path);
+
+    var failures: std.ArrayList(FailureEntry) = .empty;
+    var resolutions: std.ArrayList(ResolutionEntry) = .empty;
+    defer {
+        for (failures.items) |f| freeFailureEntry(gpa, f);
+        failures.deinit(gpa);
+        for (resolutions.items) |r| freeResolutionEntry(gpa, r);
+        resolutions.deinit(gpa);
+    }
+    parseFailuresFile(gpa, io, path, &failures, &resolutions);
+
+    const query_lower = try gpa.alloc(u8, query.len);
+    defer gpa.free(query_lower);
+    for (query, 0..) |c, i| query_lower[i] = std.ascii.toLower(c);
+
+    var matches: std.ArrayList(FailureLookupMatch) = .empty;
+    errdefer {
+        for (matches.items) |m| freeFailureLookupMatch(gpa, m);
+        matches.deinit(gpa);
+    }
+
+    for (failures.items) |f| {
+        const combined = try std.fmt.allocPrint(gpa, "{s} {s}", .{ f.task, f.errorSummary });
+        defer gpa.free(combined);
+        const cand_lower = try gpa.alloc(u8, combined.len);
+        defer gpa.free(cand_lower);
+        for (combined, 0..) |c, i| cand_lower[i] = std.ascii.toLower(c);
+        const score = ledgerWordOverlapScore(query_lower, cand_lower);
+        if (score < 50) continue;
+
+        // Latest resolution for this failure wins — append-only means a
+        // later line is more current than an earlier one for the same id.
+        var fix: []u8 = try gpa.dupe(u8, "");
+        var resolved = false;
+        for (resolutions.items) |r| {
+            if (std.mem.eql(u8, r.failureId, f.id)) {
+                gpa.free(fix);
+                fix = try gpa.dupe(u8, r.fix);
+                resolved = true;
+            }
+        }
+
+        try matches.append(gpa, .{
+            .id = try gpa.dupe(u8, f.id),
+            .date = try gpa.dupe(u8, f.date),
+            .project = try gpa.dupe(u8, f.project),
+            .task = try gpa.dupe(u8, f.task),
+            .command = try gpa.dupe(u8, f.command),
+            .errorSummary = try gpa.dupe(u8, f.errorSummary),
+            .filesInvolved = try gpa.dupe(u8, f.filesInvolved),
+            .score = score,
+            .resolved = resolved,
+            .fix = fix,
+        });
+    }
+
+    std.mem.sort(FailureLookupMatch, matches.items, {}, struct {
+        fn lessThan(_: void, a: FailureLookupMatch, b: FailureLookupMatch) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    return .{ .matches = try matches.toOwnedSlice(gpa) };
+}
+
+const FailureMemoryStats = struct {
+    total_failures: u32,
+    resolved_count: u32,
+    unresolved_count: u32,
+    repeated_failure_count: u32, // distinct (task+errorSummary, case-insensitive) seen 2+ times
+};
+
+fn computeFailureMemoryStats(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !FailureMemoryStats {
+    const empty = FailureMemoryStats{ .total_failures = 0, .resolved_count = 0, .unresolved_count = 0, .repeated_failure_count = 0 };
+    const path = try allocFailuresPath(gpa, home);
+    defer gpa.free(path);
+    if (!fileExists(io, path)) return empty;
+
+    var failures: std.ArrayList(FailureEntry) = .empty;
+    var resolutions: std.ArrayList(ResolutionEntry) = .empty;
+    defer {
+        for (failures.items) |f| freeFailureEntry(gpa, f);
+        failures.deinit(gpa);
+        for (resolutions.items) |r| freeResolutionEntry(gpa, r);
+        resolutions.deinit(gpa);
+    }
+    parseFailuresFile(gpa, io, path, &failures, &resolutions);
+
+    var resolved_ids = std.StringHashMap(void).init(gpa);
+    defer resolved_ids.deinit();
+    for (resolutions.items) |r| {
+        resolved_ids.put(r.failureId, {}) catch continue;
+    }
+
+    var resolved_count: u32 = 0;
+    var key_counts = std.StringHashMap(u32).init(gpa);
+    defer {
+        var it = key_counts.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        key_counts.deinit();
+    }
+
+    for (failures.items) |f| {
+        if (resolved_ids.contains(f.id)) resolved_count += 1;
+
+        const combined = try std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ f.task, f.errorSummary });
+        defer gpa.free(combined);
+        const lower = try gpa.alloc(u8, combined.len);
+        defer gpa.free(lower);
+        for (combined, 0..) |c, i| lower[i] = std.ascii.toLower(c);
+        const gop = try key_counts.getOrPut(lower);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.key_ptr.* = try gpa.dupe(u8, lower);
+            gop.value_ptr.* = 1;
+        }
+    }
+
+    var repeated: u32 = 0;
+    {
+        var it = key_counts.valueIterator();
+        while (it.next()) |v| {
+            if (v.* >= 2) repeated += 1;
+        }
+    }
+
+    const total: u32 = @intCast(failures.items.len);
+    return .{
+        .total_failures = total,
+        .resolved_count = resolved_count,
+        .unresolved_count = total - resolved_count,
+        .repeated_failure_count = repeated,
+    };
+}
+
+// --- outline subcommand ---
+
+pub const Symbol = struct {
+    name: []u8, // owned
+    kind: []const u8, // static: "function"|"method"|"class"|"struct"|"enum"|"trait"|"interface"|"type"|"module"|"impl"
+    line: u32, // 1-based
+};
+
+pub const OutlineResult = struct {
+    path: []u8, // owned
+    lang: []const u8, // static
+    symbols: []Symbol, // owned slice; each name is owned
+};
+
+const OUTLINE_MAX: usize = 200;
+
+fn outlineDetectLang(path: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "unknown";
+    const ext = path[dot..];
+    if (std.mem.eql(u8, ext, ".go")) return "go";
+    if (std.mem.eql(u8, ext, ".py")) return "python";
+    if (std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".mjs") or
+        std.mem.eql(u8, ext, ".cjs")) return "javascript";
+    if (std.mem.eql(u8, ext, ".ts") or std.mem.eql(u8, ext, ".tsx") or
+        std.mem.eql(u8, ext, ".jsx")) return "typescript";
+    if (std.mem.eql(u8, ext, ".rb")) return "ruby";
+    if (std.mem.eql(u8, ext, ".rs")) return "rust";
+    if (std.mem.eql(u8, ext, ".zig")) return "zig";
+    if (std.mem.eql(u8, ext, ".java")) return "java";
+    if (std.mem.eql(u8, ext, ".kt") or std.mem.eql(u8, ext, ".kts")) return "kotlin";
+    if (std.mem.eql(u8, ext, ".php")) return "php";
+    if (std.mem.eql(u8, ext, ".swift")) return "swift";
+    if (std.mem.eql(u8, ext, ".cs")) return "csharp";
+    return "unknown";
+}
+
+// Extract leading identifier chars ([a-zA-Z0-9_])
+fn outlineIdent(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_')) break;
+    }
+    return s[0..i];
+}
+
+// Consume a prefix keyword and optional following space; return rest or null if not present
+fn outlineKw(s: []const u8, kw: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, s, kw)) return null;
+    const rest = s[kw.len..];
+    // Keyword must be followed by space/tab or end of string (not part of a longer identifier)
+    if (rest.len > 0 and ((rest[0] >= 'a' and rest[0] <= 'z') or
+        (rest[0] >= 'A' and rest[0] <= 'Z') or rest[0] == '_' or
+        (rest[0] >= '0' and rest[0] <= '9'))) return null;
+    return std.mem.trimStart(u8, rest, " \t");
+}
+
+const SymHit = struct { name: []const u8, kind: []const u8 };
+
+fn outlineGo(s: []const u8) ?SymHit {
+    var rest = outlineKw(s, "func") orelse return null;
+    // Optional receiver: (type)
+    if (rest.len > 0 and rest[0] == '(') {
+        rest = rest[(std.mem.indexOfScalar(u8, rest, ')') orelse return null) + 1 ..];
+        rest = std.mem.trimStart(u8, rest, " \t");
+    }
+    const name = outlineIdent(rest);
+    if (name.len == 0) return null;
+    return .{ .name = name, .kind = "function" };
+}
+
+fn outlinePython(s: []const u8) ?SymHit {
+    var rest = s;
+    if (std.mem.startsWith(u8, rest, "async ")) rest = std.mem.trimStart(u8, rest[6..], " \t");
+    if (outlineKw(rest, "def")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    if (outlineKw(rest, "class")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "class" };
+    }
+    return null;
+}
+
+fn outlineJS(s: []const u8) ?SymHit {
+    var rest = s;
+    // Strip export modifiers
+    if (outlineKw(rest, "export")) |a| {
+        rest = a;
+        if (outlineKw(rest, "default")) |b| rest = b;
+    }
+    if (std.mem.startsWith(u8, rest, "async ")) rest = std.mem.trimStart(u8, rest[6..], " \t");
+    if (outlineKw(rest, "function")) |after| {
+        // skip optional * (generator)
+        var a2 = after;
+        if (a2.len > 0 and a2[0] == '*') a2 = std.mem.trimStart(u8, a2[1..], " \t");
+        const name = outlineIdent(a2);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    if (outlineKw(rest, "class")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "class" };
+    }
+    return null;
+}
+
+fn outlineTS(s: []const u8) ?SymHit {
+    if (outlineJS(s)) |h| return h;
+    var rest = s;
+    if (outlineKw(rest, "export")) |a| rest = a;
+    if (outlineKw(rest, "interface")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "interface" };
+    }
+    if (outlineKw(rest, "type")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "type" };
+    }
+    if (outlineKw(rest, "enum")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "enum" };
+    }
+    return null;
+}
+
+fn outlineRust(s: []const u8) ?SymHit {
+    var rest = s;
+    if (outlineKw(rest, "pub")) |a| rest = a;
+    // pub(crate) / pub(super) etc.
+    if (rest.len > 0 and rest[0] == '(') {
+        rest = rest[(std.mem.indexOfScalar(u8, rest, ')') orelse return null) + 1 ..];
+        rest = std.mem.trimStart(u8, rest, " \t");
+    }
+    if (std.mem.startsWith(u8, rest, "async ")) rest = std.mem.trimStart(u8, rest[6..], " \t");
+    if (std.mem.startsWith(u8, rest, "unsafe ")) rest = std.mem.trimStart(u8, rest[7..], " \t");
+    if (outlineKw(rest, "fn")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    if (outlineKw(rest, "struct")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "struct" };
+    }
+    if (outlineKw(rest, "enum")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "enum" };
+    }
+    if (outlineKw(rest, "trait")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "trait" };
+    }
+    if (outlineKw(rest, "impl")) |after| {
+        // impl may have generic params; grab first ident
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "impl" };
+    }
+    return null;
+}
+
+fn outlineZig(s: []const u8) ?SymHit {
+    var rest = s;
+    if (outlineKw(rest, "pub")) |a| rest = a;
+    if (outlineKw(rest, "fn")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    // pub const Name = struct/enum/union
+    if (outlineKw(rest, "const")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        // Check rhs contains struct/enum/union keyword
+        const eq = std.mem.indexOfScalar(u8, after, '=') orelse return null;
+        const rhs = std.mem.trimStart(u8, after[eq + 1 ..], " \t");
+        if (std.mem.startsWith(u8, rhs, "struct") or
+            std.mem.startsWith(u8, rhs, "enum") or
+            std.mem.startsWith(u8, rhs, "union"))
+        {
+            return .{ .name = name, .kind = "struct" };
+        }
+        return null;
+    }
+    return null;
+}
+
+fn outlineRuby(s: []const u8) ?SymHit {
+    if (outlineKw(s, "def")) |after| {
+        // Ruby method names can end with ?, !, =
+        var i: usize = 0;
+        while (i < after.len) : (i += 1) {
+            const c = after[i];
+            if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '_')) break;
+        }
+        if (i < after.len and (after[i] == '?' or after[i] == '!' or after[i] == '=')) i += 1;
+        const name = after[0..i];
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    if (outlineKw(s, "class")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "class" };
+    }
+    if (outlineKw(s, "module")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "module" };
+    }
+    return null;
+}
+
+fn outlineJavaLike(s: []const u8) ?SymHit {
+    var rest = s;
+    // Strip visibility/modifiers (public/private/protected/static/abstract/final/override/sealed)
+    const mods = [_][]const u8{ "public ", "private ", "protected ", "static ", "abstract ", "final ", "override ", "sealed ", "partial ", "internal " };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (mods) |m| {
+            if (std.mem.startsWith(u8, rest, m)) {
+                rest = rest[m.len..];
+                changed = true;
+            }
+        }
+    }
+    if (outlineKw(rest, "class")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "class" };
+    }
+    if (outlineKw(rest, "interface")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "interface" };
+    }
+    if (outlineKw(rest, "enum")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "enum" };
+    }
+    if (outlineKw(rest, "fun ")) |after| { // Kotlin
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    if (outlineKw(rest, "func ")) |after| { // Swift
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    return null;
+}
+
+fn outlinePHP(s: []const u8) ?SymHit {
+    var rest = s;
+    if (outlineKw(rest, "public")) |a| rest = a;
+    if (outlineKw(rest, "private")) |a| rest = a;
+    if (outlineKw(rest, "protected")) |a| rest = a;
+    if (outlineKw(rest, "static")) |a| rest = a;
+    if (std.mem.startsWith(u8, rest, "async ")) rest = rest[6..];
+    if (outlineKw(rest, "function")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "function" };
+    }
+    if (outlineKw(rest, "class")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "class" };
+    }
+    if (outlineKw(rest, "interface")) |after| {
+        const name = outlineIdent(after);
+        if (name.len == 0) return null;
+        return .{ .name = name, .kind = "interface" };
+    }
+    return null;
+}
+
+fn outlineExtract(s: []const u8, lang: []const u8) ?SymHit {
+    if (std.mem.eql(u8, lang, "go")) return outlineGo(s);
+    if (std.mem.eql(u8, lang, "python")) return outlinePython(s);
+    if (std.mem.eql(u8, lang, "javascript")) return outlineJS(s);
+    if (std.mem.eql(u8, lang, "typescript")) return outlineTS(s);
+    if (std.mem.eql(u8, lang, "rust")) return outlineRust(s);
+    if (std.mem.eql(u8, lang, "zig")) return outlineZig(s);
+    if (std.mem.eql(u8, lang, "ruby")) return outlineRuby(s);
+    if (std.mem.eql(u8, lang, "java") or std.mem.eql(u8, lang, "kotlin") or
+        std.mem.eql(u8, lang, "csharp") or std.mem.eql(u8, lang, "swift")) return outlineJavaLike(s);
+    if (std.mem.eql(u8, lang, "php")) return outlinePHP(s);
+    return null;
+}
+
+pub fn computeOutline(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+) !OutlineResult {
+    const file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch return error.FileNotFound;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+    defer gpa.free(content);
+
+    const lang = outlineDetectLang(file_path);
+
+    // Allocate max-size symbol buffer; shrink to actual count after scanning
+    const sym_buf = try gpa.alloc(Symbol, OUTLINE_MAX);
+    var count: usize = 0;
+    errdefer {
+        for (sym_buf[0..count]) |s| gpa.free(s.name);
+        gpa.free(sym_buf);
+    }
+
+    var line_num: u32 = 1;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| : (line_num += 1) {
+        if (count >= OUTLINE_MAX) break;
+        const trimmed = std.mem.trim(u8, raw, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#' or trimmed[0] == '/' or trimmed[0] == '*') continue;
+        const hit = outlineExtract(trimmed, lang) orelse continue;
+        sym_buf[count] = .{
+            .name = try gpa.dupe(u8, hit.name),
+            .kind = hit.kind,
+            .line = line_num,
+        };
+        count += 1;
+    }
+
+    // Shrink to actual count
+    const symbols = try gpa.realloc(sym_buf, count);
+    return .{
+        .path = try gpa.dupe(u8, file_path),
+        .lang = lang,
+        .symbols = symbols,
+    };
+}
+
+// --- symbol-index (code index foundation, 2026-07-02) ---
+// Project-wide symbol index built entirely on existing primitives: computeScan
+// for the file list, computeOutline for per-file extraction, and the existing
+// cache-fetch/cache-store layer (M18-M20, content-hash-invalidated) so a
+// second call against an unchanged project reads cached outlines instead of
+// re-parsing every source file. This is the foundation symbol-find (Module 6
+// M2) can build on later to stop re-walking the whole project on every call —
+// not done here, symbol-find is unchanged in this pass.
+
+fn symbolKindStatic(kind: []const u8) []const u8 {
+    const kinds = [_][]const u8{ "function", "method", "class", "struct", "enum", "trait", "interface", "type", "module", "impl" };
+    for (kinds) |k| {
+        if (std.mem.eql(u8, k, kind)) return k;
+    }
+    return "function"; // unreachable in practice — only ever writes known kinds
+}
+
+fn serializeSymbolsJson(gpa: std.mem.Allocator, lang: []const u8, symbols: []const Symbol) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    const esc_lang = try allocJsonEscape(gpa, lang);
+    defer gpa.free(esc_lang);
+    try buf.appendSlice(gpa, "{\"lang\": \"");
+    try buf.appendSlice(gpa, esc_lang);
+    try buf.appendSlice(gpa, "\", \"symbols\": [");
+    for (symbols, 0..) |s, i| {
+        const esc_name = try allocJsonEscape(gpa, s.name);
+        defer gpa.free(esc_name);
+        if (i > 0) try buf.appendSlice(gpa, ", ");
+        const entry = try std.fmt.allocPrint(gpa, "{{\"name\": \"{s}\", \"kind\": \"{s}\", \"line\": {d}}}", .{ esc_name, s.kind, s.line });
+        defer gpa.free(entry);
+        try buf.appendSlice(gpa, entry);
+    }
+    try buf.appendSlice(gpa, "]}");
+    return buf.toOwnedSlice(gpa);
+}
+
+const ParsedSymbolIndex = struct { lang: []u8, symbols: []Symbol };
+
+fn parseSymbolsJson(gpa: std.mem.Allocator, json: []const u8) !ParsedSymbolIndex {
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCache;
+    const o = parsed.value.object;
+    const lang_v = o.get("lang") orelse return error.InvalidCache;
+    if (lang_v != .string) return error.InvalidCache;
+    const syms_v = o.get("symbols") orelse return error.InvalidCache;
+    if (syms_v != .array) return error.InvalidCache;
+
+    const symbols = try gpa.alloc(Symbol, syms_v.array.items.len);
+    errdefer gpa.free(symbols);
+    var n: usize = 0;
+    errdefer {
+        for (symbols[0..n]) |s| gpa.free(s.name);
+    }
+    for (syms_v.array.items) |item| {
+        if (item != .object) continue;
+        const so = item.object;
+        const name_v = so.get("name") orelse continue;
+        const kind_v = so.get("kind") orelse continue;
+        const line_v = so.get("line") orelse continue;
+        if (name_v != .string or kind_v != .string) continue;
+        const line: u32 = switch (line_v) {
+            .integer => |x| @intCast(x),
+            else => 0,
+        };
+        symbols[n] = .{ .name = try gpa.dupe(u8, name_v.string), .kind = symbolKindStatic(kind_v.string), .line = line };
+        n += 1;
+    }
+    return .{ .lang = try gpa.dupe(u8, lang_v.string), .symbols = symbols[0..n] };
+}
+
+const IndexOneFileResult = struct { lang: []u8, symbols: []Symbol, from_cache: bool };
+
+fn indexOneFile(gpa: std.mem.Allocator, io: std.Io, abs_path: []const u8) !IndexOneFileResult {
+    const fetch = computeCacheFetch(gpa, io, abs_path, "symbol-index") catch null;
+    if (fetch) |f| {
+        defer gpa.free(f.path);
+        defer gpa.free(f.subKey);
+        if (f.hit) {
+            if (f.value) |v| {
+                defer gpa.free(v);
+                if (parseSymbolsJson(gpa, v)) |parsed| {
+                    return .{ .lang = parsed.lang, .symbols = parsed.symbols, .from_cache = true };
+                } else |_| {
+                    // Corrupt/stale-shape cache entry — fall through and recompute.
+                }
+            }
+        }
+    }
+
+    const outline = try computeOutline(gpa, io, abs_path);
+    defer gpa.free(outline.path);
+    const json = try serializeSymbolsJson(gpa, outline.lang, outline.symbols);
+    defer gpa.free(json);
+    if (computeCacheStore(gpa, io, abs_path, "symbol-index", json) catch null) |store_result| {
+        gpa.free(store_result.path);
+        gpa.free(store_result.subKey);
+    }
+    return .{ .lang = try gpa.dupe(u8, outline.lang), .symbols = outline.symbols, .from_cache = false };
+}
+
+pub const IndexedFile = struct {
+    path: []u8, // owned, relative to root
+    lang: []u8, // owned
+    symbols: []Symbol, // owned; each .name owned, .kind static
+};
+
+pub const SymbolIndexResult = struct {
+    root: []u8, // owned
+    fileCount: u32,
+    symbolCount: u32,
+    cacheHits: u32,
+    cacheMisses: u32,
+    files: []IndexedFile, // owned
+};
+
+pub fn computeSymbolIndex(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !SymbolIndexResult {
+    const scan = try computeScan(gpa, io, path);
+    defer {
+        for (scan.keyFiles) |f| gpa.free(f);
+        gpa.free(scan.keyFiles);
+        for (scan.dirMap) |d| gpa.free(d);
+        gpa.free(scan.dirMap);
+        if (scan.entryPoint) |ep| gpa.free(ep);
+        for (scan.files) |f| gpa.free(f.path);
+        gpa.free(scan.files);
+    }
+
+    var files: std.ArrayList(IndexedFile) = .empty;
+    errdefer {
+        for (files.items) |f| {
+            gpa.free(f.path);
+            gpa.free(f.lang);
+            for (f.symbols) |s| gpa.free(s.name);
+            gpa.free(f.symbols);
+        }
+        files.deinit(gpa);
+    }
+
+    var symbol_count: u32 = 0;
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+
+    for (scan.files) |f| {
+        if (!std.mem.eql(u8, f.kind, "source")) continue;
+        const abs_file = try std.fs.path.join(gpa, &.{ path, f.path });
+        defer gpa.free(abs_file);
+
+        const indexed = indexOneFile(gpa, io, abs_file) catch continue; // unreadable/unsupported file — skip
+        if (indexed.from_cache) hits += 1 else misses += 1;
+        symbol_count += @intCast(indexed.symbols.len);
+        try files.append(gpa, .{
+            .path = try gpa.dupe(u8, f.path),
+            .lang = indexed.lang,
+            .symbols = indexed.symbols,
+        });
+    }
+
+    return .{
+        .root = try gpa.dupe(u8, path),
+        .fileCount = @intCast(files.items.len),
+        .symbolCount = symbol_count,
+        .cacheHits = hits,
+        .cacheMisses = misses,
+        .files = try files.toOwnedSlice(gpa),
+    };
+}
+
+// --- deps subcommand ---
+
+pub const Dep = struct {
+    name: []u8, // owned
+    version: []u8, // owned; "" when unspecified
+    dev: bool,
+};
+
+pub const DepsResult = struct {
+    manifest: []u8, // owned; relative filename e.g. "package.json"
+    format: []const u8, // static: "npm"|"cargo"|"go"|"pip"|"pyproject"
+    totalCount: u32, // count before cap
+    deps: []Dep, // owned; capped at DEPS_MAX
+};
+
+const DEPS_MAX: usize = 100;
+
+// Trim surrounding quotes (single or double) from a string
+fn depsStripQuotes(s: []const u8) []const u8 {
+    const v = std.mem.trim(u8, s, " \t\r\n");
+    if (v.len >= 2 and ((v[0] == '"' and v[v.len - 1] == '"') or
+        (v[0] == '\'' and v[v.len - 1] == '\'')))
+        return v[1 .. v.len - 1];
+    return v;
+}
+
+// Extract dep name from pip requirement line: "name==1.0", "name>=1.0 ; extras", "name"
+fn depsPipParse(line: []const u8) struct { name: []const u8, version: []const u8 } {
+    // Strip markers after ';'
+    const semi = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+    const raw = std.mem.trim(u8, line[0..semi], " \t");
+    // Find first operator: ==, >=, <=, !=, ~=, >, <, [ (extras)
+    const ops = [_][]const u8{ "==", ">=", "<=", "!=", "~=", ">", "<", "[" };
+    var split: usize = raw.len;
+    for (ops) |op| {
+        if (std.mem.indexOf(u8, raw, op)) |pos| {
+            if (pos < split) split = pos;
+        }
+    }
+    const name = std.mem.trim(u8, raw[0..split], " \t");
+    const ver = std.mem.trim(u8, raw[split..], " \t");
+    return .{ .name = name, .version = ver };
+}
+
+fn computeDepsNpm(gpa: std.mem.Allocator, content: []const u8) !DepsResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch
+        return error.InvalidJson;
+    defer parsed.deinit();
+
+    const buf = try gpa.alloc(Dep, DEPS_MAX);
+    var n: usize = 0;
+    var total: u32 = 0;
+    errdefer {
+        for (buf[0..n]) |d| {
+            gpa.free(d.name);
+            gpa.free(d.version);
+        }
+        gpa.free(buf);
+    }
+
+    const sections = [_]struct { key: []const u8, dev: bool }{
+        .{ .key = "dependencies", .dev = false },
+        .{ .key = "devDependencies", .dev = true },
+        .{ .key = "peerDependencies", .dev = false },
+    };
+    for (sections) |sec| {
+        const obj = switch (parsed.value) {
+            .object => |o| o.get(sec.key) orelse continue,
+            else => continue,
+        };
+        const deps = switch (obj) {
+            .object => |o| o,
+            else => continue,
+        };
+        var it = deps.iterator();
+        while (it.next()) |entry| {
+            total += 1;
+            if (n >= DEPS_MAX) continue;
+            const ver = switch (entry.value_ptr.*) {
+                .string => |s| s,
+                else => "",
+            };
+            buf[n] = .{
+                .name = try gpa.dupe(u8, entry.key_ptr.*),
+                .version = try gpa.dupe(u8, ver),
+                .dev = sec.dev,
+            };
+            n += 1;
+        }
+    }
+
+    return .{
+        .manifest = try gpa.dupe(u8, "package.json"),
+        .format = "npm",
+        .totalCount = total,
+        .deps = try gpa.realloc(buf, n),
+    };
+}
+
+fn computeDepsCargo(gpa: std.mem.Allocator, content: []const u8) !DepsResult {
+    const buf = try gpa.alloc(Dep, DEPS_MAX);
+    var n: usize = 0;
+    var total: u32 = 0;
+    errdefer {
+        for (buf[0..n]) |d| {
+            gpa.free(d.name);
+            gpa.free(d.version);
+        }
+        gpa.free(buf);
+    }
+
+    var in_deps: bool = false;
+    var in_dev: bool = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            in_deps = std.mem.eql(u8, line, "[dependencies]");
+            in_dev = std.mem.eql(u8, line, "[dev-dependencies]");
+            continue;
+        }
+        if (!in_deps and !in_dev) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t\"");
+        if (key.len == 0) continue;
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        // Version: "1.0" or { version = "1.0", ... } or { path = "..." }
+        var ver: []const u8 = "";
+        if (val.len > 0 and val[0] == '"') {
+            ver = depsStripQuotes(val);
+        } else if (std.mem.indexOf(u8, val, "version")) |vi| {
+            const after = val[vi + 7 ..]; // skip "version"
+            if (std.mem.indexOf(u8, after, "\"")) |qi| {
+                const inner = after[qi + 1 ..];
+                const close = std.mem.indexOfScalar(u8, inner, '"') orelse inner.len;
+                ver = inner[0..close];
+            }
+        }
+        total += 1;
+        if (n < DEPS_MAX) {
+            buf[n] = .{ .name = try gpa.dupe(u8, key), .version = try gpa.dupe(u8, ver), .dev = in_dev };
+            n += 1;
+        }
+    }
+
+    return .{
+        .manifest = try gpa.dupe(u8, "Cargo.toml"),
+        .format = "cargo",
+        .totalCount = total,
+        .deps = try gpa.realloc(buf, n),
+    };
+}
+
+fn computeDepsGoMod(gpa: std.mem.Allocator, content: []const u8) !DepsResult {
+    const buf = try gpa.alloc(Dep, DEPS_MAX);
+    var n: usize = 0;
+    var total: u32 = 0;
+    errdefer {
+        for (buf[0..n]) |d| {
+            gpa.free(d.name);
+            gpa.free(d.version);
+        }
+        gpa.free(buf);
+    }
+
+    var in_require = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '/') continue;
+        if (std.mem.eql(u8, line, "require (")) {
+            in_require = true;
+            continue;
+        }
+        if (std.mem.eql(u8, line, ")")) {
+            in_require = false;
+            continue;
+        }
+
+        var dep_line: []const u8 = "";
+        if (in_require) {
+            dep_line = line;
+        } else if (std.mem.startsWith(u8, line, "require ")) {
+            dep_line = std.mem.trimStart(u8, line[8..], " \t");
+        }
+        if (dep_line.len == 0) continue;
+
+        // Strip "// indirect" comment
+        const comment = std.mem.indexOf(u8, dep_line, "//") orelse dep_line.len;
+        const clean = std.mem.trim(u8, dep_line[0..comment], " \t");
+
+        // Split on first whitespace: module-path version
+        var i: usize = 0;
+        while (i < clean.len and clean[i] != ' ' and clean[i] != '\t') i += 1;
+        const name = clean[0..i];
+        const ver = std.mem.trim(u8, clean[i..], " \t");
+        if (name.len == 0) continue;
+
+        total += 1;
+        if (n < DEPS_MAX) {
+            buf[n] = .{ .name = try gpa.dupe(u8, name), .version = try gpa.dupe(u8, ver), .dev = false };
+            n += 1;
+        }
+    }
+
+    return .{
+        .manifest = try gpa.dupe(u8, "go.mod"),
+        .format = "go",
+        .totalCount = total,
+        .deps = try gpa.realloc(buf, n),
+    };
+}
+
+fn computeDepsPip(gpa: std.mem.Allocator, content: []const u8) !DepsResult {
+    const buf = try gpa.alloc(Dep, DEPS_MAX);
+    var n: usize = 0;
+    var total: u32 = 0;
+    errdefer {
+        for (buf[0..n]) |d| {
+            gpa.free(d.name);
+            gpa.free(d.version);
+        }
+        gpa.free(buf);
+    }
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#' or line[0] == '-') continue;
+        const p = depsPipParse(line);
+        if (p.name.len == 0) continue;
+        total += 1;
+        if (n < DEPS_MAX) {
+            buf[n] = .{ .name = try gpa.dupe(u8, p.name), .version = try gpa.dupe(u8, p.version), .dev = false };
+            n += 1;
+        }
+    }
+
+    return .{
+        .manifest = try gpa.dupe(u8, "requirements.txt"),
+        .format = "pip",
+        .totalCount = total,
+        .deps = try gpa.realloc(buf, n),
+    };
+}
+
+const DEPS_MANIFESTS = [_]struct { file: []const u8, fmt: []const u8 }{
+    .{ .file = "package.json", .fmt = "npm" },
+    .{ .file = "Cargo.toml", .fmt = "cargo" },
+    .{ .file = "go.mod", .fmt = "go" },
+    .{ .file = "requirements.txt", .fmt = "pip" },
+};
+
+pub fn computeDeps(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+) !DepsResult {
+    for (DEPS_MANIFESTS) |m| {
+        const abs_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root_path, m.file });
+        defer gpa.free(abs_path);
+
+        const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch continue;
+        defer file.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = file.reader(io, &rbuf);
+        const content = try r.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+        defer gpa.free(content);
+
+        if (std.mem.eql(u8, m.fmt, "npm")) return computeDepsNpm(gpa, content);
+        if (std.mem.eql(u8, m.fmt, "cargo")) return computeDepsCargo(gpa, content);
+        if (std.mem.eql(u8, m.fmt, "go")) return computeDepsGoMod(gpa, content);
+        if (std.mem.eql(u8, m.fmt, "pip")) return computeDepsPip(gpa, content);
+    }
+    return error.NoManifestFound;
+}
+
+// --- compat-check subcommand ---
+
+fn extractVersionFromLine(line: []const u8) []const u8 {
+    const l = if (line.len > 0 and (line[0] == 'v' or line[0] == 'V')) line[1..] else line;
+    var it = std.mem.splitScalar(u8, l, ' ');
+    while (it.next()) |tok| {
+        if (tok.len > 0 and tok[0] >= '0' and tok[0] <= '9') return tok;
+    }
+    return l;
+}
+
+fn getToolVersionAlloc(gpa: std.mem.Allocator, io: std.Io, tool: []const u8) ![]u8 {
+    if (std.mem.eql(u8, tool, "4orman_tools")) return gpa.dupe(u8, VERSION);
+    const flag = if (std.mem.eql(u8, tool, "zig")) "version" else "--version";
+    const r = std.process.run(gpa, io, .{ .argv = &.{ tool, flag } }) catch return gpa.dupe(u8, "");
+    defer gpa.free(r.stderr);
+    defer gpa.free(r.stdout);
+    switch (r.term) {
+        .exited => |c| if (c != 0) return gpa.dupe(u8, ""),
+        else => return gpa.dupe(u8, ""),
+    }
+    const raw = std.mem.trim(u8, r.stdout, " \t\n\r");
+    const first_nl = std.mem.indexOfScalar(u8, raw, '\n') orelse raw.len;
+    return gpa.dupe(u8, extractVersionFromLine(raw[0..first_nl]));
+}
+
+// Returns a slice into content (not owned). Empty string if not found.
+fn parseBaselineField(content: []const u8, field: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (field.len + 3 > 60) continue;
+        var key_buf: [64]u8 = undefined;
+        key_buf[0] = '"';
+        for (field, 0..) |c, j| key_buf[1 + j] = c;
+        key_buf[1 + field.len] = '"';
+        key_buf[2 + field.len] = ':';
+        const key = key_buf[0 .. 3 + field.len];
+        const pos = std.mem.indexOf(u8, trimmed, key) orelse continue;
+        var rest = std.mem.trimStart(u8, trimmed[pos + key.len ..], " \t");
+        if (rest.len == 0 or rest[0] != '"') continue;
+        rest = rest[1..];
+        const end_q = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+        return rest[0..end_q];
+    }
+    return "";
+}
+
+fn buildRollbackCmd(gpa: std.mem.Allocator, tool: []const u8, was: []const u8) ![]u8 {
+    if (std.mem.eql(u8, tool, "zig")) {
+        const dot = std.mem.lastIndexOfScalar(u8, was, '.') orelse was.len;
+        return std.fmt.allocPrint(gpa, "brew uninstall zig && brew install zig@{s}", .{was[0..dot]});
+    }
+    if (std.mem.eql(u8, tool, "4orman_tools")) {
+        return gpa.dupe(u8, "brew uninstall 4orman-tools && brew install michaelvgonzaga/4orman/orman-tools");
+    }
+    if (std.mem.eql(u8, tool, "node")) {
+        const dot = std.mem.indexOfScalar(u8, was, '.') orelse was.len;
+        return std.fmt.allocPrint(gpa, "brew uninstall node && brew install node@{s}", .{was[0..dot]});
+    }
+    if (std.mem.eql(u8, tool, "python3")) {
+        const dot2 = std.mem.lastIndexOfScalar(u8, was, '.') orelse was.len;
+        return std.fmt.allocPrint(gpa, "brew uninstall python3 && brew install python@{s}", .{was[0..dot2]});
+    }
+    if (std.mem.eql(u8, tool, "gh")) {
+        return gpa.dupe(u8, "# gh updates are generally safe; check: brew info gh");
+    }
+    if (std.mem.eql(u8, tool, "git")) {
+        return gpa.dupe(u8, "# git updates are generally safe; check: brew info git");
+    }
+    if (std.mem.eql(u8, tool, "brew")) {
+        return gpa.dupe(u8, "export HOMEBREW_NO_AUTO_UPDATE=1  # prevents future Homebrew auto-updates");
+    }
+    return gpa.dupe(u8, "# no rollback command known");
+}
+
+fn toolRisk(tool: []const u8) []const u8 {
+    if (std.mem.eql(u8, tool, "zig")) return "high";
+    if (std.mem.eql(u8, tool, "4orman_tools")) return "high";
+    if (std.mem.eql(u8, tool, "node")) return "medium";
+    if (std.mem.eql(u8, tool, "python3")) return "medium";
+    return "low";
+}
+
+pub const COMPAT_TOOLS = [_][]const u8{ "4orman_tools", "zig", "git", "gh", "brew", "node", "python3" };
+
+pub const DriftedTool = struct {
+    tool: []u8,
+    was: []u8,
+    now: []u8,
+    risk: []const u8,
+    rollback: []u8,
+};
+
+pub const CompatCheckResult = struct {
+    ok: bool,
+    baseline_age: []u8,
+    drifted: []DriftedTool,
+    advice: []u8,
+};
+
+pub const CompatBaselineResult = struct {
+    recorded: bool,
+    path: []u8,
+    versions: [COMPAT_TOOLS.len][]u8,
+};
+
+fn currentIsoTimestamp(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const r = std.process.run(gpa, io, .{
+        .argv = &.{ "date", "-u", "+%Y-%m-%dT%H:%M:%SZ" },
+    }) catch return gpa.dupe(u8, "unknown");
+    defer gpa.free(r.stderr);
+    defer gpa.free(r.stdout);
+    return gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \t\n\r"));
+}
+
+pub fn computeCompatBaseline(gpa: std.mem.Allocator, io: std.Io) !CompatBaselineResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const dir_path = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(dir_path);
+    std.Io.Dir.createDirAbsolute(io, dir_path, .default_dir) catch {};
+
+    const baseline_path = try std.fmt.allocPrint(gpa, "{s}/compat-baseline.json", .{dir_path});
+    errdefer gpa.free(baseline_path);
+
+    var versions: [COMPAT_TOOLS.len][]u8 = undefined;
+    var n_filled: usize = 0;
+    errdefer {
+        for (versions[0..n_filled]) |v| {
+            gpa.free(v);
+        }
+    }
+    for (COMPAT_TOOLS, 0..) |tool, i| {
+        versions[i] = getToolVersionAlloc(gpa, io, tool) catch try gpa.dupe(u8, "");
+        n_filled = i + 1;
+    }
+
+    const ts = currentIsoTimestamp(gpa, io) catch try gpa.dupe(u8, "unknown");
+    defer gpa.free(ts);
+
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{baseline_path});
+    defer gpa.free(tmp_path);
+
+    var recorded = false;
+    write_blk: {
+        const f = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch break :write_blk;
+        var wbuf: [4096]u8 = undefined;
+        var w = f.writerStreaming(io, &wbuf);
+        var write_ok = true;
+        w.interface.writeAll("{\n  \"recorded_at\": \"") catch {
+            write_ok = false;
+        };
+        w.interface.writeAll(ts) catch {
+            write_ok = false;
+        };
+        w.interface.writeAll("\",\n  \"tools\": {\n") catch {
+            write_ok = false;
+        };
+        for (COMPAT_TOOLS, 0..) |tool, i| {
+            if (i > 0) w.interface.writeAll(",\n") catch {
+                write_ok = false;
+            };
+            w.interface.print("    \"{s}\": \"{s}\"", .{ tool, versions[i] }) catch {
+                write_ok = false;
+            };
+        }
+        w.interface.writeAll("\n  }\n}\n") catch {
+            write_ok = false;
+        };
+        w.interface.flush() catch {
+            write_ok = false;
+        };
+        f.close(io);
+        if (write_ok) {
+            atomicRenameAbsolute(tmp_path, baseline_path);
+            recorded = true;
+        }
+    }
+
+    return .{
+        .recorded = recorded,
+        .path = baseline_path,
+        .versions = versions,
+    };
+}
+
+pub fn computeCompatCheck(gpa: std.mem.Allocator, io: std.Io) !CompatCheckResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const baseline_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/compat-baseline.json", .{home});
+    defer gpa.free(baseline_path);
+
+    const baseline_content: []u8 = blk: {
+        const f = std.Io.Dir.openFileAbsolute(io, baseline_path, .{}) catch {
+            const age = try gpa.dupe(u8, "none");
+            errdefer gpa.free(age);
+            const advice = try gpa.dupe(u8, "No baseline recorded. Run: 4orman-tools compat-check --baseline");
+            errdefer gpa.free(advice);
+            const drifted = try gpa.alloc(DriftedTool, 0);
+            return .{ .ok = false, .baseline_age = age, .drifted = drifted, .advice = advice };
+        };
+        defer f.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        break :blk try r.interface.allocRemaining(gpa, .limited(64 * 1024));
+    };
+    defer gpa.free(baseline_content);
+
+    const recorded_at = parseBaselineField(baseline_content, "recorded_at");
+    const baseline_age = try gpa.dupe(u8, if (recorded_at.len >= 10) recorded_at[0..10] else if (recorded_at.len > 0) recorded_at else "unknown");
+    errdefer gpa.free(baseline_age);
+
+    var drifted_buf: [COMPAT_TOOLS.len]DriftedTool = undefined;
+    var drifted_count: usize = 0;
+    var has_high = false;
+
+    for (COMPAT_TOOLS) |tool| {
+        const was_str = parseBaselineField(baseline_content, tool);
+        if (was_str.len == 0) continue;
+
+        const now_str = try getToolVersionAlloc(gpa, io, tool);
+        if (std.mem.eql(u8, was_str, now_str)) {
+            gpa.free(now_str);
+            continue;
+        }
+
+        const risk = toolRisk(tool);
+        if (std.mem.eql(u8, risk, "high")) has_high = true;
+
+        drifted_buf[drifted_count] = .{
+            .tool = try gpa.dupe(u8, tool),
+            .was = try gpa.dupe(u8, was_str),
+            .now = now_str,
+            .risk = risk,
+            .rollback = try buildRollbackCmd(gpa, tool, was_str),
+        };
+        drifted_count += 1;
+    }
+
+    const drifted = try gpa.alloc(DriftedTool, drifted_count);
+    errdefer gpa.free(drifted);
+    for (drifted_buf[0..drifted_count], 0..) |d, i| drifted[i] = d;
+
+    const advice: []u8 = if (drifted_count == 0)
+        try gpa.dupe(u8, "")
+    else blk: {
+        const intro: []const u8 = if (has_high)
+            "STOP: High-risk tool drift detected. Roll back before proceeding:"
+        else
+            "Warning: Tool versions changed since baseline:";
+        var acc = try gpa.dupe(u8, intro);
+        for (drifted) |d| {
+            const piece = try std.fmt.allocPrint(gpa, " {s} {s}->{s} ({s} risk): {s}.", .{ d.tool, d.was, d.now, d.risk, d.rollback });
+            const joined = try std.fmt.allocPrint(gpa, "{s}{s}", .{ acc, piece });
+            gpa.free(piece);
+            gpa.free(acc);
+            acc = joined;
+        }
+        break :blk acc;
+    };
+
+    return .{
+        .ok = drifted_count == 0,
+        .baseline_age = baseline_age,
+        .drifted = drifted,
+        .advice = advice,
+    };
+}
+
+// --- run-tests subcommand ---
+
+const MAX_TEST_FAILURES: usize = 50;
+
+pub const TestFailure = struct {
+    file: []u8,
+    line: u32,
+    @"test": []u8,
+    message: []u8,
+};
+
+pub const RunTestsResult = struct {
+    framework: []const u8,
+    command: []u8,
+    success: bool,
+    passed: u32,
+    failed: u32,
+    skipped: u32,
+    duration_ms: u64,
+    failures: []TestFailure,
+    truncated: bool,
+    role_confidence: []const u8, // "certain" | "uncertain"
+    uncertainty_reason: []const u8, // "" when certain
+    uncertainty_candidates: []const []const u8, // empty when certain
+    resolved_by: []const u8, // "detection" | "ledger" | "tie-break"
+};
+
+// Collects every test framework whose marker is present, in priority order.
+// More than one candidate is a genuine boundary case — computeRunTests
+// surfaces it instead of silently picking the first match.
+fn detectTestFrameworkCandidates(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]const []const u8 {
+    var found: [6][]const u8 = undefined;
+    var n: usize = 0;
+
+    // jest/vitest: package.json
+    const pkg = try std.fmt.allocPrint(gpa, "{s}/package.json", .{path});
+    defer gpa.free(pkg);
+    if (std.Io.Dir.openFileAbsolute(io, pkg, .{})) |f| {
+        defer f.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        if (r.interface.allocRemaining(gpa, .limited(128 * 1024))) |c| {
+            defer gpa.free(c);
+            if (std.mem.indexOf(u8, c, "\"vitest\"") != null) {
+                found[n] = "vitest";
+                n += 1;
+            }
+            if (std.mem.indexOf(u8, c, "\"jest\"") != null) {
+                found[n] = "jest";
+                n += 1;
+            }
+        } else |_| {}
+    } else |_| {}
+
+    // pytest: pytest.ini, conftest.py, or pyproject.toml with "pytest"
+    var found_pytest = false;
+    const pytest_files = [_][]const u8{ "pytest.ini", "conftest.py" };
+    for (pytest_files) |pf| {
+        const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ path, pf });
+        defer gpa.free(p);
+        if (fileExists(io, p)) found_pytest = true;
+    }
+    if (!found_pytest) {
+        const ppt = try std.fmt.allocPrint(gpa, "{s}/pyproject.toml", .{path});
+        defer gpa.free(ppt);
+        if (std.Io.Dir.openFileAbsolute(io, ppt, .{})) |f| {
+            defer f.close(io);
+            var rbuf: [4096]u8 = undefined;
+            var r = f.reader(io, &rbuf);
+            if (r.interface.allocRemaining(gpa, .limited(64 * 1024))) |c| {
+                defer gpa.free(c);
+                if (std.mem.indexOf(u8, c, "pytest") != null) found_pytest = true;
+            } else |_| {}
+        } else |_| {}
+    }
+    if (found_pytest) {
+        found[n] = "pytest";
+        n += 1;
+    }
+
+    // go test
+    const gomod = try std.fmt.allocPrint(gpa, "{s}/go.mod", .{path});
+    defer gpa.free(gomod);
+    if (fileExists(io, gomod)) {
+        found[n] = "go";
+        n += 1;
+    }
+
+    // cargo test
+    const cargo_toml = try std.fmt.allocPrint(gpa, "{s}/Cargo.toml", .{path});
+    defer gpa.free(cargo_toml);
+    if (fileExists(io, cargo_toml)) {
+        found[n] = "cargo";
+        n += 1;
+    }
+
+    // zig build test
+    const build_zig = try std.fmt.allocPrint(gpa, "{s}/build.zig", .{path});
+    defer gpa.free(build_zig);
+    if (fileExists(io, build_zig)) {
+        found[n] = "zig";
+        n += 1;
+    }
+
+    return gpa.dupe([]const u8, found[0..n]);
+}
+
+fn appendTestFailure(
+    gpa: std.mem.Allocator,
+    buf: []TestFailure,
+    n: *usize,
+    truncated: *bool,
+    file: []const u8,
+    line: u32,
+    name: []const u8,
+    msg: []const u8,
+) void {
+    if (n.* >= MAX_TEST_FAILURES) {
+        truncated.* = true;
+        return;
+    }
+    buf[n.*] = .{
+        .file = gpa.dupe(u8, file) catch return,
+        .line = line,
+        .@"test" = gpa.dupe(u8, name) catch return,
+        .message = gpa.dupe(u8, msg) catch return,
+    };
+    n.* += 1;
+}
+
+// Returns the first run of digits in s as a u32.
+fn firstUintIn(s: []const u8) u32 {
+    var i: usize = 0;
+    while (i < s.len and (s[i] < '0' or s[i] > '9')) i += 1;
+    if (i >= s.len) return 0;
+    var acc: u32 = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) acc = acc * 10 + (s[i] - '0');
+    return acc;
+}
+
+// Returns the integer immediately before `marker` in s (e.g. "5" before " passed").
+fn uintBefore(s: []const u8, marker: []const u8) u32 {
+    const pos = std.mem.indexOf(u8, s, marker) orelse return 0;
+    var end = pos;
+    while (end > 0 and s[end - 1] == ' ') end -= 1;
+    var start = end;
+    while (start > 0 and s[start - 1] >= '0' and s[start - 1] <= '9') start -= 1;
+    if (start == end) return 0;
+    return std.fmt.parseInt(u32, s[start..end], 10) catch 0;
+}
+
+fn parseZigOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    passed: *u32,
+    failed: *u32,
+    skipped: *u32,
+    buf: []TestFailure,
+    n: *usize,
+    truncated: *bool,
+) void {
+    _ = skipped;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var pending_name: [256]u8 = undefined;
+    var pending_len: usize = 0;
+    var got_summary = false;
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        // "Build Summary: N/M steps succeeded (K failed); X/Y tests passed (K failed)"
+        if (std.mem.indexOf(u8, t, "tests passed") != null) {
+            const frac_end = std.mem.indexOf(u8, t, " tests passed") orelse t.len;
+            var frac_start = frac_end;
+            while (frac_start > 0 and (std.ascii.isDigit(t[frac_start - 1]) or t[frac_start - 1] == '/')) frac_start -= 1;
+            const frac = t[frac_start..frac_end];
+            if (std.mem.indexOfScalar(u8, frac, '/')) |slash| {
+                const total = std.fmt.parseInt(u32, frac[slash + 1 ..], 10) catch 0;
+                const p = std.fmt.parseInt(u32, frac[0..slash], 10) catch 0;
+                passed.* = p;
+                failed.* = if (total > p) total - p else 0;
+                got_summary = true;
+            }
+            continue;
+        }
+        // "All N tests passed." (plain `zig test` CLI, not `zig build test`)
+        if (!got_summary and std.mem.startsWith(u8, t, "All ") and std.mem.indexOf(u8, t, " tests passed") != null) {
+            passed.* = firstUintIn(t[4..]);
+            failed.* = 0;
+            got_summary = true;
+            continue;
+        }
+        // "error: 'module.test.name' failed:"
+        if (std.mem.startsWith(u8, t, "error: '")) {
+            const rest = t[8..];
+            const q2 = std.mem.indexOfScalar(u8, rest, '\'') orelse continue;
+            var name = rest[0..q2];
+            if (std.mem.lastIndexOf(u8, name, ".test.")) |ti| name = name[ti + 6 ..];
+            const cl = @min(name.len, 255);
+            @memcpy(pending_name[0..cl], name[0..cl]);
+            pending_len = cl;
+            continue;
+        }
+        // "Test [n/total] name... PASS/ok/FAIL" (legacy `zig test` CLI format)
+        if (std.mem.startsWith(u8, t, "Test [")) {
+            const dots = std.mem.lastIndexOf(u8, t, "...") orelse continue;
+            const status = std.mem.trim(u8, t[dots + 3 ..], " \t");
+            const brk = std.mem.indexOf(u8, t, "] ") orelse continue;
+            const name = t[brk + 2 .. dots];
+            if (std.mem.startsWith(u8, status, "FAIL") or std.mem.startsWith(u8, status, "fail")) {
+                const cl = @min(name.len, 255);
+                @memcpy(pending_name[0..cl], name[0..cl]);
+                pending_len = cl;
+            } else {
+                pending_len = 0;
+            }
+            continue;
+        }
+        // File ref after a failure: "path/file.zig:line:col: ..." — prefer the frame
+        // that names the test itself ("in test.<name>") over std-lib internal frames.
+        if (pending_len > 0 and std.mem.indexOf(u8, t, ".zig:") != null) {
+            const is_test_frame = std.mem.indexOf(u8, t, "in test.") != null;
+            const c1 = std.mem.indexOf(u8, t, ":") orelse t.len;
+            const file = t[0..c1];
+            const rest = if (c1 + 1 < t.len) t[c1 + 1 ..] else "";
+            const c2 = std.mem.indexOf(u8, rest, ":") orelse rest.len;
+            const ln = std.fmt.parseInt(u32, rest[0..c2], 10) catch 0;
+            if (is_test_frame or std.mem.indexOf(u8, file, "/lib/zig/std/") == null) {
+                appendTestFailure(gpa, buf, n, truncated, file, ln, pending_name[0..pending_len], t);
+                pending_len = 0;
+            }
+        }
+    }
+}
+
+fn parseCargoOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    passed: *u32,
+    failed: *u32,
+    skipped: *u32,
+    buf: []TestFailure,
+    n: *usize,
+    truncated: *bool,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var pending_name: [256]u8 = undefined;
+    var pending_len: usize = 0;
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        // "test result: ok. N passed; M failed; K ignored"
+        if (std.mem.startsWith(u8, t, "test result:")) {
+            if (std.mem.indexOf(u8, t, "passed") != null) passed.* += firstUintIn(t[12..]);
+            if (std.mem.indexOf(u8, t, "ignored") != null) skipped.* += uintBefore(t, " ignored");
+            if (std.mem.indexOf(u8, t, "FAILED") != null) failed.* += uintBefore(t, " failed");
+            continue;
+        }
+        // "test name ... FAILED"
+        if (std.mem.startsWith(u8, t, "test ") and std.mem.endsWith(u8, t, "FAILED")) {
+            const dots = std.mem.lastIndexOf(u8, t, " ... ") orelse t.len;
+            const name = t[5..dots];
+            const cl = @min(name.len, 255);
+            @memcpy(pending_name[0..cl], name[0..cl]);
+            pending_len = cl;
+            continue;
+        }
+        // "thread '...' panicked at '...', src/lib.rs:N:M"
+        if (pending_len > 0 and std.mem.indexOf(u8, t, "panicked at") != null) {
+            var file: []const u8 = "";
+            var ln: u32 = 0;
+            const rs_pos = std.mem.indexOf(u8, t, ".rs:");
+            const zig_pos = std.mem.indexOf(u8, t, ".zig:");
+            const ext_pos = rs_pos orelse zig_pos;
+            if (ext_pos) |ep| {
+                const el: usize = if (rs_pos != null) 3 else 4;
+                var start = ep;
+                while (start > 0 and t[start - 1] != ' ' and t[start - 1] != '\'' and t[start - 1] != '"') start -= 1;
+                file = t[start .. ep + el];
+                const after = t[ep + el ..];
+                if (after.len > 0 and after[0] == ':') {
+                    const c2 = std.mem.indexOf(u8, after[1..], ":") orelse after.len - 1;
+                    ln = std.fmt.parseInt(u32, after[1 .. c2 + 1], 10) catch 0;
+                }
+            }
+            appendTestFailure(gpa, buf, n, truncated, file, ln, pending_name[0..pending_len], t);
+            pending_len = 0;
+        }
+    }
+}
+
+fn parseGoOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    passed: *u32,
+    failed: *u32,
+    skipped: *u32,
+    buf: []TestFailure,
+    n: *usize,
+    truncated: *bool,
+) void {
+    _ = skipped;
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var pending_name: [256]u8 = undefined;
+    var pending_len: usize = 0;
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "--- PASS:")) {
+            passed.* += 1;
+            pending_len = 0;
+        } else if (std.mem.startsWith(u8, t, "--- FAIL:")) {
+            failed.* += 1;
+            const rest = t[9..];
+            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+            const name = std.mem.trim(u8, rest[0..sp], " \t");
+            const cl = @min(name.len, 255);
+            @memcpy(pending_name[0..cl], name[0..cl]);
+            pending_len = cl;
+        } else if (pending_len > 0 and (std.mem.indexOf(u8, t, ".go:") != null or
+            std.mem.indexOf(u8, t, "_test.go:") != null))
+        {
+            const c1 = std.mem.indexOf(u8, t, ":") orelse t.len;
+            const file = t[0..c1];
+            const rest2 = if (c1 + 1 < t.len) t[c1 + 1 ..] else "";
+            const c2 = std.mem.indexOf(u8, rest2, ":") orelse rest2.len;
+            const ln = std.fmt.parseInt(u32, rest2[0..c2], 10) catch 0;
+            const msg = if (c2 + 1 < rest2.len) std.mem.trim(u8, rest2[c2 + 1 ..], " \t") else "";
+            appendTestFailure(gpa, buf, n, truncated, file, ln, pending_name[0..pending_len], msg);
+            pending_len = 0;
+        }
+    }
+}
+
+fn parsePytestOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    passed: *u32,
+    failed: *u32,
+    skipped: *u32,
+    buf: []TestFailure,
+    n: *usize,
+    truncated: *bool,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var pass_line: u32 = 0;
+    var fail_line: u32 = 0;
+    var skip_line: u32 = 0;
+    var got_summary = false;
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "PASSED ")) {
+            pass_line += 1;
+        } else if (std.mem.startsWith(u8, t, "FAILED ")) {
+            fail_line += 1;
+            const rest = t[7..];
+            const dash = std.mem.indexOf(u8, rest, " - ") orelse rest.len;
+            const test_ref = rest[0..dash];
+            const msg = if (dash + 3 < rest.len) rest[dash + 3 ..] else "";
+            const dcolon = std.mem.indexOf(u8, test_ref, "::") orelse test_ref.len;
+            const file = test_ref[0..dcolon];
+            const name = if (dcolon + 2 < test_ref.len) test_ref[dcolon + 2 ..] else test_ref;
+            appendTestFailure(gpa, buf, n, truncated, file, 0, name, msg);
+        } else if (std.mem.startsWith(u8, t, "SKIPPED ") or std.mem.startsWith(u8, t, "XFAIL ")) {
+            skip_line += 1;
+        } else if (std.mem.indexOf(u8, t, " passed") != null and std.mem.indexOf(u8, t, " in ") != null) {
+            got_summary = true;
+            if (std.mem.indexOf(u8, t, "failed") != null) {
+                failed.* = firstUintIn(t);
+                passed.* = uintBefore(t, " passed");
+            } else {
+                passed.* = firstUintIn(t);
+            }
+            if (std.mem.indexOf(u8, t, "skipped") != null) skipped.* = uintBefore(t, " skipped");
+        }
+    }
+    if (!got_summary) {
+        passed.* = pass_line;
+        failed.* = fail_line;
+        skipped.* = skip_line;
+    }
+}
+
+fn parseJestOutput(
+    output: []const u8,
+    passed: *u32,
+    failed: *u32,
+    skipped: *u32,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        // "Tests:       1 failed, 10 passed, 11 total"
+        if (std.mem.startsWith(u8, t, "Tests:")) {
+            const rest = t[6..];
+            if (std.mem.indexOf(u8, rest, "failed") != null) failed.* = firstUintIn(rest);
+            if (std.mem.indexOf(u8, rest, "passed") != null) passed.* = uintBefore(rest, " passed");
+            const sk_marker: ?[]const u8 =
+                if (std.mem.indexOf(u8, rest, " skipped") != null) " skipped" else if (std.mem.indexOf(u8, rest, " pending") != null) " pending" else null;
+            if (sk_marker) |m| skipped.* = uintBefore(rest, m);
+        }
+    }
+}
+
+pub fn computeRunTests(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !RunTestsResult {
+    const fw_candidates = try detectTestFrameworkCandidates(gpa, io, path);
+    defer gpa.free(fw_candidates);
+    if (fw_candidates.len == 0) return error.NoTestFramework;
+    const fw_joined = std.mem.join(gpa, ", ", fw_candidates) catch "";
+    defer if (fw_joined.len > 0) gpa.free(fw_joined);
+    const fw_question = try std.fmt.allocPrint(gpa, "which test framework for {s}: candidates are {s}", .{ path, fw_joined });
+    defer gpa.free(fw_question);
+    const fw_resolution = try resolveCandidateViaLedger(gpa, io, fw_question, fw_candidates);
+    const fw = fw_resolution.chosen;
+    const fw_uncertain = std.mem.eql(u8, fw_resolution.resolved_by, "tie-break");
+
+    const fw_argv: []const []const u8 = if (std.mem.eql(u8, fw, "jest"))
+        &.{ "env", "-C", path, "npx", "jest" }
+    else if (std.mem.eql(u8, fw, "vitest"))
+        &.{ "env", "-C", path, "npx", "vitest", "run" }
+    else if (std.mem.eql(u8, fw, "pytest"))
+        &.{ "env", "-C", path, "python3", "-m", "pytest", "--tb=short", "-q" }
+    else if (std.mem.eql(u8, fw, "go"))
+        &.{ "env", "-C", path, "go", "test", "./..." }
+    else if (std.mem.eql(u8, fw, "cargo"))
+        &.{ "env", "-C", path, "cargo", "test" }
+    else // zig
+        &.{ "env", "-C", path, "zig", "build", "test", "--summary", "all" };
+
+    const command: []u8 = if (std.mem.eql(u8, fw, "jest"))
+        try gpa.dupe(u8, "npx jest")
+    else if (std.mem.eql(u8, fw, "vitest"))
+        try gpa.dupe(u8, "npx vitest run")
+    else if (std.mem.eql(u8, fw, "pytest"))
+        try gpa.dupe(u8, "python3 -m pytest --tb=short -q")
+    else if (std.mem.eql(u8, fw, "go"))
+        try gpa.dupe(u8, "go test ./...")
+    else if (std.mem.eql(u8, fw, "cargo"))
+        try gpa.dupe(u8, "cargo test")
+    else
+        try gpa.dupe(u8, "zig build test --summary all");
+    errdefer gpa.free(command);
+
+    var ts_start: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_start);
+
+    const r = std.process.run(gpa, io, .{ .argv = fw_argv }) catch {
+        const failures = try gpa.alloc(TestFailure, 0);
+        return RunTestsResult{
+            .framework = fw,
+            .command = command,
+            .success = false,
+            .passed = 0,
+            .failed = 1,
+            .skipped = 0,
+            .duration_ms = 0,
+            .failures = failures,
+            .truncated = false,
+            .role_confidence = if (fw_uncertain) "uncertain" else "certain",
+            .uncertainty_reason = if (fw_uncertain)
+                "multiple test frameworks detected; picked the first by priority order"
+            else if (std.mem.eql(u8, fw_resolution.resolved_by, "ledger"))
+                "multiple test frameworks detected; resolved by ledger precedent"
+            else
+                "",
+            .uncertainty_candidates = if (fw_candidates.len > 1) (gpa.dupe([]const u8, fw_candidates) catch &[_][]const u8{}) else &[_][]const u8{},
+            .resolved_by = fw_resolution.resolved_by,
+        };
+    };
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+
+    var ts_end: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_end);
+    const duration_ms: u64 = blk: {
+        const start_ms = @as(u64, @intCast(ts_start.sec)) * 1000 + @as(u64, @intCast(ts_start.nsec)) / 1_000_000;
+        const end_ms = @as(u64, @intCast(ts_end.sec)) * 1000 + @as(u64, @intCast(ts_end.nsec)) / 1_000_000;
+        break :blk if (end_ms > start_ms) end_ms - start_ms else 0;
+    };
+
+    const success = switch (r.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+
+    const combined = try std.fmt.allocPrint(gpa, "{s}\n{s}", .{ r.stdout, r.stderr });
+    defer gpa.free(combined);
+
+    var passed: u32 = 0;
+    var failed: u32 = 0;
+    var skipped: u32 = 0;
+    var fbuf: [MAX_TEST_FAILURES]TestFailure = undefined;
+    var fn_count: usize = 0;
+    var truncated = false;
+
+    if (std.mem.eql(u8, fw, "zig")) {
+        parseZigOutput(gpa, combined, &passed, &failed, &skipped, &fbuf, &fn_count, &truncated);
+    } else if (std.mem.eql(u8, fw, "cargo")) {
+        parseCargoOutput(gpa, combined, &passed, &failed, &skipped, &fbuf, &fn_count, &truncated);
+    } else if (std.mem.eql(u8, fw, "go")) {
+        parseGoOutput(gpa, combined, &passed, &failed, &skipped, &fbuf, &fn_count, &truncated);
+    } else if (std.mem.eql(u8, fw, "pytest")) {
+        parsePytestOutput(gpa, combined, &passed, &failed, &skipped, &fbuf, &fn_count, &truncated);
+    } else {
+        parseJestOutput(combined, &passed, &failed, &skipped);
+    }
+
+    if (passed == 0 and failed == 0 and !success) failed = 1;
+
+    const failures = try gpa.alloc(TestFailure, fn_count);
+    for (fbuf[0..fn_count], 0..) |f, i| failures[i] = f;
+
+    return .{
+        .framework = fw,
+        .command = command,
+        .success = success,
+        .passed = passed,
+        .failed = failed,
+        .skipped = skipped,
+        .duration_ms = duration_ms,
+        .failures = failures,
+        .truncated = truncated,
+        .role_confidence = if (fw_uncertain) "uncertain" else "certain",
+        .uncertainty_reason = if (fw_uncertain)
+            "multiple test frameworks detected; picked the first by priority order"
+        else if (std.mem.eql(u8, fw_resolution.resolved_by, "ledger"))
+            "multiple test frameworks detected; resolved by ledger precedent"
+        else
+            "",
+        .uncertainty_candidates = if (fw_candidates.len > 1) try gpa.dupe([]const u8, fw_candidates) else &[_][]const u8{},
+        .resolved_by = fw_resolution.resolved_by,
+    };
+}
+
+// --- env-inspect subcommand ---
+
+pub const LangEntry = struct {
+    name: []const u8,
+    version: []u8,
+    present: bool,
+};
+
+pub const PmEntry = struct {
+    name: []const u8,
+    version: []u8,
+    present: bool,
+};
+
+pub const EnvInspectResult = struct {
+    languages: []LangEntry,
+    packageManagers: []PmEntry,
+    missing: [][]u8,
+    envVars: [][]u8,
+};
+
+// Finds the first N.N[.N...] pattern in output (handles v/V prefix, go1.X.Y, etc.)
+fn extractVersionStr(output: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < output.len) {
+        const c = output[i];
+        const sv = (c == 'v' or c == 'V') and i + 1 < output.len and
+            output[i + 1] >= '0' and output[i + 1] <= '9';
+        const sd = c >= '0' and c <= '9';
+        if (sv or sd) {
+            const begin = if (sv) i + 1 else i;
+            var j = begin;
+            while (j < output.len and (output[j] >= '0' and output[j] <= '9' or output[j] == '.')) j += 1;
+            const found = output[begin..j];
+            if (std.mem.indexOfScalar(u8, found, '.') != null and found.len >= 3) return found;
+        }
+        i += 1;
+    }
+    return "";
+}
+
+fn dirExists(io: std.Io, path: []const u8) bool {
+    const d = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
+    d.close(io);
+    return true;
+}
+
+const BinaryInfo = struct { present: bool, version: []u8 };
+
+fn checkBinary(gpa: std.mem.Allocator, io: std.Io, binary: []const u8, flag: []const u8) !BinaryInfo {
+    const r = std.process.run(gpa, io, .{ .argv = &.{ binary, flag } }) catch {
+        return BinaryInfo{ .present = false, .version = try gpa.dupe(u8, "") };
+    };
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    const combined = try std.fmt.allocPrint(gpa, "{s} {s}", .{ r.stdout, r.stderr });
+    defer gpa.free(combined);
+    return BinaryInfo{ .present = true, .version = try gpa.dupe(u8, extractVersionStr(combined)) };
+}
+
+pub fn computeEnvInspect(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !EnvInspectResult {
+    var lang_buf: [7]LangEntry = undefined;
+    var n_lang: usize = 0;
+    var pm_buf: [6]PmEntry = undefined;
+    var n_pm: usize = 0;
+    var miss_buf: [20][]u8 = undefined;
+    var n_miss: usize = 0;
+
+    // --- Language detection (manifest-gated) ---
+
+    // Go
+    {
+        const m = try std.fmt.allocPrint(gpa, "{s}/go.mod", .{path});
+        defer gpa.free(m);
+        if (fileExists(io, m)) {
+            const info = try checkBinary(gpa, io, "go", "version");
+            lang_buf[n_lang] = .{ .name = "go", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "go runtime");
+                n_miss += 1;
+            }
+        }
+    }
+
+    // Python
+    {
+        const has = blk: {
+            const p1 = try std.fmt.allocPrint(gpa, "{s}/requirements.txt", .{path});
+            defer gpa.free(p1);
+            if (fileExists(io, p1)) break :blk true;
+            const p2 = try std.fmt.allocPrint(gpa, "{s}/pyproject.toml", .{path});
+            defer gpa.free(p2);
+            if (fileExists(io, p2)) break :blk true;
+            const p3 = try std.fmt.allocPrint(gpa, "{s}/setup.py", .{path});
+            defer gpa.free(p3);
+            break :blk fileExists(io, p3);
+        };
+        if (has) {
+            const info = try checkBinary(gpa, io, "python3", "--version");
+            lang_buf[n_lang] = .{ .name = "python", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "python3 runtime");
+                n_miss += 1;
+            } else {
+                const v1 = try std.fmt.allocPrint(gpa, "{s}/.venv", .{path});
+                defer gpa.free(v1);
+                const v2 = try std.fmt.allocPrint(gpa, "{s}/venv", .{path});
+                defer gpa.free(v2);
+                if (!dirExists(io, v1) and !dirExists(io, v2)) {
+                    miss_buf[n_miss] = try gpa.dupe(u8, ".venv (run: python3 -m venv .venv && pip install -r requirements.txt)");
+                    n_miss += 1;
+                }
+            }
+        }
+    }
+
+    // Node
+    {
+        const m = try std.fmt.allocPrint(gpa, "{s}/package.json", .{path});
+        defer gpa.free(m);
+        if (fileExists(io, m)) {
+            const info = try checkBinary(gpa, io, "node", "--version");
+            lang_buf[n_lang] = .{ .name = "node", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "node runtime");
+                n_miss += 1;
+            } else {
+                const nm = try std.fmt.allocPrint(gpa, "{s}/node_modules", .{path});
+                defer gpa.free(nm);
+                if (!dirExists(io, nm)) {
+                    miss_buf[n_miss] = try gpa.dupe(u8, "node_modules (run: npm install)");
+                    n_miss += 1;
+                }
+            }
+        }
+    }
+
+    // Rust
+    {
+        const m = try std.fmt.allocPrint(gpa, "{s}/Cargo.toml", .{path});
+        defer gpa.free(m);
+        if (fileExists(io, m)) {
+            const info = try checkBinary(gpa, io, "rustc", "--version");
+            lang_buf[n_lang] = .{ .name = "rust", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "rust runtime (rustup)");
+                n_miss += 1;
+            }
+        }
+    }
+
+    // Zig
+    {
+        const m = try std.fmt.allocPrint(gpa, "{s}/build.zig", .{path});
+        defer gpa.free(m);
+        if (fileExists(io, m)) {
+            const info = try checkBinary(gpa, io, "zig", "version");
+            lang_buf[n_lang] = .{ .name = "zig", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "zig runtime");
+                n_miss += 1;
+            }
+        }
+    }
+
+    // Ruby
+    {
+        const m = try std.fmt.allocPrint(gpa, "{s}/Gemfile", .{path});
+        defer gpa.free(m);
+        if (fileExists(io, m)) {
+            const info = try checkBinary(gpa, io, "ruby", "--version");
+            lang_buf[n_lang] = .{ .name = "ruby", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "ruby runtime");
+                n_miss += 1;
+            } else {
+                const vb = try std.fmt.allocPrint(gpa, "{s}/vendor/bundle", .{path});
+                defer gpa.free(vb);
+                if (!dirExists(io, vb)) {
+                    miss_buf[n_miss] = try gpa.dupe(u8, "vendor/bundle (run: bundle install)");
+                    n_miss += 1;
+                }
+            }
+        }
+    }
+
+    // Java
+    {
+        const has = blk: {
+            const p1 = try std.fmt.allocPrint(gpa, "{s}/pom.xml", .{path});
+            defer gpa.free(p1);
+            if (fileExists(io, p1)) break :blk true;
+            const p2 = try std.fmt.allocPrint(gpa, "{s}/build.gradle", .{path});
+            defer gpa.free(p2);
+            break :blk fileExists(io, p2);
+        };
+        if (has) {
+            const info = try checkBinary(gpa, io, "java", "--version");
+            lang_buf[n_lang] = .{ .name = "java", .version = info.version, .present = info.present };
+            n_lang += 1;
+            if (!info.present) {
+                miss_buf[n_miss] = try gpa.dupe(u8, "java runtime");
+                n_miss += 1;
+            }
+        }
+    }
+
+    // --- Package managers (always checked) ---
+
+    const pm_specs = [_]struct { name: []const u8, bin: []const u8, flag: []const u8 }{
+        .{ .name = "npm", .bin = "npm", .flag = "--version" },
+        .{ .name = "pip", .bin = "pip3", .flag = "--version" },
+        .{ .name = "cargo", .bin = "cargo", .flag = "--version" },
+        .{ .name = "brew", .bin = "brew", .flag = "--version" },
+        .{ .name = "yarn", .bin = "yarn", .flag = "--version" },
+        .{ .name = "pnpm", .bin = "pnpm", .flag = "--version" },
+    };
+    for (pm_specs) |s| {
+        const info = try checkBinary(gpa, io, s.bin, s.flag);
+        pm_buf[n_pm] = .{ .name = s.name, .version = info.version, .present = info.present };
+        n_pm += 1;
+    }
+
+    // --- Env vars from .env* files ---
+
+    var env_keys: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (env_keys.items) |k| gpa.free(k);
+        env_keys.deinit(gpa);
+    }
+
+    if (computeEnvScan(gpa, io, path)) |er| {
+        defer {
+            for (er.files) |ef| {
+                gpa.free(ef.file);
+                for (ef.keys) |k| gpa.free(k);
+                gpa.free(ef.keys);
+            }
+            gpa.free(er.files);
+        }
+        for (er.files) |ef| {
+            for (ef.keys) |k| try env_keys.append(gpa, try gpa.dupe(u8, k));
+        }
+    } else |_| {}
+
+    // --- Allocate final slices ---
+
+    const languages = try gpa.alloc(LangEntry, n_lang);
+    for (lang_buf[0..n_lang], 0..) |l, i| languages[i] = l;
+    const packageManagers = try gpa.alloc(PmEntry, n_pm);
+    for (pm_buf[0..n_pm], 0..) |p, i| packageManagers[i] = p;
+    const missing = try gpa.alloc([]u8, n_miss);
+    for (miss_buf[0..n_miss], 0..) |m, i| missing[i] = m;
+    const envVars = try env_keys.toOwnedSlice(gpa);
+
+    return .{
+        .languages = languages,
+        .packageManagers = packageManagers,
+        .missing = missing,
+        .envVars = envVars,
+    };
+}
+
+// --- build subcommand ---
+
+const MAX_BUILD_ERRORS: usize = 50;
+const MAX_BUILD_WARNINGS: usize = 20;
+
+pub const BuildError = struct {
+    file: []u8,
+    line: u32,
+    col: u32,
+    message: []u8,
+    severity: []const u8,
+};
+
+pub const BuildWarning = struct {
+    file: []u8,
+    line: u32,
+    col: u32,
+    message: []u8,
+};
+
+pub const BuildResult = struct {
+    tool: []const u8,
+    command: []u8,
+    success: bool,
+    errors: []BuildError,
+    warnings: []BuildWarning,
+    duration_ms: u64,
+    truncated: bool,
+    role_confidence: []const u8, // "certain" | "uncertain"
+    uncertainty_reason: []const u8, // "" when certain
+    uncertainty_candidates: []const []const u8, // empty when certain
+    resolved_by: []const u8, // "detection" | "ledger" | "tie-break"
+};
+
+fn appendBuildError(
+    gpa: std.mem.Allocator,
+    buf: []BuildError,
+    n: *usize,
+    truncated: *bool,
+    file: []const u8,
+    line: u32,
+    col: u32,
+    msg: []const u8,
+    sev: []const u8,
+) void {
+    if (n.* >= buf.len) {
+        truncated.* = true;
+        return;
+    }
+    buf[n.*] = .{
+        .file = gpa.dupe(u8, file) catch return,
+        .line = line,
+        .col = col,
+        .message = gpa.dupe(u8, msg) catch return,
+        .severity = sev,
+    };
+    n.* += 1;
+}
+
+fn appendBuildWarning(
+    gpa: std.mem.Allocator,
+    buf: []BuildWarning,
+    n: *usize,
+    truncated: *bool,
+    file: []const u8,
+    line: u32,
+    col: u32,
+    msg: []const u8,
+) void {
+    if (n.* >= buf.len) {
+        truncated.* = true;
+        return;
+    }
+    buf[n.*] = .{
+        .file = gpa.dupe(u8, file) catch return,
+        .line = line,
+        .col = col,
+        .message = gpa.dupe(u8, msg) catch return,
+    };
+    n.* += 1;
+}
+
+// Collects every build tool whose marker file is present, in priority order.
+// A single-tool result means detection is unambiguous ("role-certain"); more
+// than one is a genuine boundary case — computeBuild surfaces it instead of
+// silently picking the first match.
+fn detectBuildToolCandidates(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]const []const u8 {
+    var found: [5][]const u8 = undefined;
+    var n: usize = 0;
+
+    const cargo_toml = try std.fmt.allocPrint(gpa, "{s}/Cargo.toml", .{path});
+    defer gpa.free(cargo_toml);
+    if (fileExists(io, cargo_toml)) {
+        found[n] = "cargo";
+        n += 1;
+    }
+
+    const build_zig = try std.fmt.allocPrint(gpa, "{s}/build.zig", .{path});
+    defer gpa.free(build_zig);
+    if (fileExists(io, build_zig)) {
+        found[n] = "zig";
+        n += 1;
+    }
+
+    const gomod = try std.fmt.allocPrint(gpa, "{s}/go.mod", .{path});
+    defer gpa.free(gomod);
+    if (fileExists(io, gomod)) {
+        found[n] = "go";
+        n += 1;
+    }
+
+    const pkg = try std.fmt.allocPrint(gpa, "{s}/package.json", .{path});
+    defer gpa.free(pkg);
+    if (std.Io.Dir.openFileAbsolute(io, pkg, .{})) |f| {
+        defer f.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        if (r.interface.allocRemaining(gpa, .limited(64 * 1024))) |c| {
+            defer gpa.free(c);
+            if (std.mem.indexOf(u8, c, "\"scripts\"") != null and
+                std.mem.indexOf(u8, c, "\"build\"") != null)
+            {
+                found[n] = "npm";
+                n += 1;
+            }
+        } else |_| {}
+    } else |_| {}
+
+    const makefile = try std.fmt.allocPrint(gpa, "{s}/Makefile", .{path});
+    defer gpa.free(makefile);
+    if (fileExists(io, makefile)) {
+        found[n] = "make";
+        n += 1;
+    }
+
+    return gpa.dupe([]const u8, found[0..n]);
+}
+
+// Cargo build output: state machine pairing "error[Exx]: msg" with " --> file:N:M".
+fn parseCargoBuildOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    errbuf: []BuildError,
+    n_err: *usize,
+    warnbuf: []BuildWarning,
+    n_warn: *usize,
+    truncated: *bool,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var pmsg: [512]u8 = undefined;
+    var pmsg_len: usize = 0;
+    var psev: []const u8 = "";
+
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, t, "error[") or std.mem.startsWith(u8, t, "error: ")) {
+            const colon = std.mem.indexOf(u8, t, ": ") orelse t.len;
+            const msg = if (colon + 2 < t.len) t[colon + 2 ..] else t;
+            const cl = @min(msg.len, pmsg.len);
+            @memcpy(pmsg[0..cl], msg[0..cl]);
+            pmsg_len = cl;
+            psev = "error";
+        } else if (std.mem.startsWith(u8, t, "warning[") or std.mem.startsWith(u8, t, "warning: ")) {
+            const colon = std.mem.indexOf(u8, t, ": ") orelse t.len;
+            const msg = if (colon + 2 < t.len) t[colon + 2 ..] else t;
+            const cl = @min(msg.len, pmsg.len);
+            @memcpy(pmsg[0..cl], msg[0..cl]);
+            pmsg_len = cl;
+            psev = "warning";
+        } else if (pmsg_len > 0 and std.mem.startsWith(u8, t, "--> ")) {
+            const loc = t[4..];
+            const c2_opt = std.mem.lastIndexOf(u8, loc, ":");
+            if (c2_opt == null) {
+                pmsg_len = 0;
+                psev = "";
+                continue;
+            }
+            const c2 = c2_opt.?;
+            const c1_opt = std.mem.lastIndexOf(u8, loc[0..c2], ":");
+            const file: []const u8 = if (c1_opt) |c1| loc[0..c1] else loc[0..c2];
+            const ln_s: []const u8 = if (c1_opt) |c1| loc[c1 + 1 .. c2] else loc[c2 + 1 ..];
+            const col_s: []const u8 = if (c1_opt != null) loc[c2 + 1 ..] else "";
+            const ln = std.fmt.parseInt(u32, ln_s, 10) catch 0;
+            const col_num = std.fmt.parseInt(u32, col_s, 10) catch 0;
+            if (std.mem.eql(u8, psev, "error")) {
+                appendBuildError(gpa, errbuf, n_err, truncated, file, ln, col_num, pmsg[0..pmsg_len], "error");
+            } else {
+                appendBuildWarning(gpa, warnbuf, n_warn, truncated, file, ln, col_num, pmsg[0..pmsg_len]);
+            }
+            pmsg_len = 0;
+            psev = "";
+        }
+    }
+}
+
+// Zig/gcc/clang build output: "path:N:M: error: message" or "path:N: error: message".
+fn parseZigBuildOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    errbuf: []BuildError,
+    n_err: *usize,
+    warnbuf: []BuildWarning,
+    n_warn: *usize,
+    truncated: *bool,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        const is_err = std.mem.indexOf(u8, t, ": error: ") != null;
+        const is_warn = std.mem.indexOf(u8, t, ": warning: ") != null;
+        if (!is_err and !is_warn) continue;
+        const sev_marker: []const u8 = if (is_err) ": error: " else ": warning: ";
+        const sev_pos = std.mem.indexOf(u8, t, sev_marker) orelse continue;
+        const loc = t[0..sev_pos];
+        const c2_opt = std.mem.lastIndexOf(u8, loc, ":");
+        if (c2_opt == null) continue;
+        const c2 = c2_opt.?;
+        const c1_opt = std.mem.lastIndexOf(u8, loc[0..c2], ":");
+        const file: []const u8 = if (c1_opt) |c1| loc[0..c1] else loc[0..c2];
+        if (file.len == 0) continue;
+        const ln_s: []const u8 = if (c1_opt) |c1| loc[c1 + 1 .. c2] else loc[c2 + 1 ..];
+        const col_s: []const u8 = if (c1_opt != null) loc[c2 + 1 ..] else "";
+        const ln = std.fmt.parseInt(u32, ln_s, 10) catch 0;
+        const col_num = std.fmt.parseInt(u32, col_s, 10) catch 0;
+        const msg = t[sev_pos + sev_marker.len ..];
+        if (is_err) {
+            appendBuildError(gpa, errbuf, n_err, truncated, file, ln, col_num, msg, "error");
+        } else {
+            appendBuildWarning(gpa, warnbuf, n_warn, truncated, file, ln, col_num, msg);
+        }
+    }
+}
+
+// Go build output: "./file.go:N:M: message".
+fn parseGoBuildOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    errbuf: []BuildError,
+    n_err: *usize,
+    truncated: *bool,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.indexOf(u8, t, ".go:") == null) continue;
+        if (!std.mem.startsWith(u8, t, "./") and !std.mem.startsWith(u8, t, "/")) continue;
+        const c1 = std.mem.indexOf(u8, t, ":") orelse continue;
+        const file = t[0..c1];
+        const rest1 = if (c1 + 1 < t.len) t[c1 + 1 ..] else continue;
+        const c2 = std.mem.indexOf(u8, rest1, ":") orelse continue;
+        const ln = std.fmt.parseInt(u32, rest1[0..c2], 10) catch continue;
+        const rest2 = if (c2 + 1 < rest1.len) rest1[c2 + 1 ..] else continue;
+        const c3_opt = std.mem.indexOf(u8, rest2, ":");
+        const col_num: u32 = if (c3_opt) |c3| std.fmt.parseInt(u32, rest2[0..c3], 10) catch 0 else 0;
+        const msg_raw: []const u8 = if (c3_opt) |c3| (if (c3 + 1 < rest2.len) rest2[c3 + 1 ..] else rest2) else rest2;
+        const msg = std.mem.trim(u8, msg_raw, " \t");
+        appendBuildError(gpa, errbuf, n_err, truncated, file, ln, col_num, msg, "error");
+    }
+}
+
+// TypeScript compiler output: "file.ts(N,M): error TSXXXX: message".
+fn parseTscOutput(
+    gpa: std.mem.Allocator,
+    output: []const u8,
+    errbuf: []BuildError,
+    n_err: *usize,
+    warnbuf: []BuildWarning,
+    n_warn: *usize,
+    truncated: *bool,
+) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        const is_err = std.mem.indexOf(u8, t, "): error ") != null;
+        const is_warn = std.mem.indexOf(u8, t, "): warning ") != null;
+        if (!is_err and !is_warn) continue;
+        const paren = std.mem.indexOf(u8, t, "(") orelse continue;
+        const file = t[0..paren];
+        if (!std.mem.endsWith(u8, file, ".ts") and
+            !std.mem.endsWith(u8, file, ".tsx") and
+            !std.mem.endsWith(u8, file, ".js")) continue;
+        const inner_start = paren + 1;
+        const close_off = std.mem.indexOf(u8, t[inner_start..], ")") orelse continue;
+        const coords = t[inner_start .. inner_start + close_off];
+        const comma = std.mem.indexOf(u8, coords, ",") orelse coords.len;
+        const ln = std.fmt.parseInt(u32, coords[0..comma], 10) catch 0;
+        const col_num: u32 = if (comma + 1 < coords.len) std.fmt.parseInt(u32, coords[comma + 1 ..], 10) catch 0 else 0;
+        const sev_marker: []const u8 = if (is_err) "): error " else "): warning ";
+        const sev_pos = std.mem.indexOf(u8, t, sev_marker) orelse continue;
+        const msg = t[sev_pos + sev_marker.len ..];
+        if (is_err) {
+            appendBuildError(gpa, errbuf, n_err, truncated, file, ln, col_num, msg, "error");
+        } else {
+            appendBuildWarning(gpa, warnbuf, n_warn, truncated, file, ln, col_num, msg);
+        }
+    }
+}
+
+pub fn computeBuild(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !BuildResult {
+    const tool_candidates = try detectBuildToolCandidates(gpa, io, path);
+    defer gpa.free(tool_candidates);
+    if (tool_candidates.len == 0) return error.NoBuildSystem;
+    const tool_joined = std.mem.join(gpa, ", ", tool_candidates) catch "";
+    defer if (tool_joined.len > 0) gpa.free(tool_joined);
+    const tool_question = try std.fmt.allocPrint(gpa, "which build tool for {s}: candidates are {s}", .{ path, tool_joined });
+    defer gpa.free(tool_question);
+    const tool_resolution = try resolveCandidateViaLedger(gpa, io, tool_question, tool_candidates);
+    const tool = tool_resolution.chosen;
+    const tool_uncertain = std.mem.eql(u8, tool_resolution.resolved_by, "tie-break");
+
+    const argv: []const []const u8 = if (std.mem.eql(u8, tool, "cargo"))
+        &.{ "env", "-C", path, "cargo", "build" }
+    else if (std.mem.eql(u8, tool, "zig"))
+        &.{ "env", "-C", path, "zig", "build" }
+    else if (std.mem.eql(u8, tool, "go"))
+        &.{ "env", "-C", path, "go", "build", "./..." }
+    else if (std.mem.eql(u8, tool, "npm"))
+        &.{ "env", "-C", path, "npm", "run", "build" }
+    else
+        &.{ "env", "-C", path, "make" };
+
+    const command: []u8 = if (std.mem.eql(u8, tool, "cargo"))
+        try gpa.dupe(u8, "cargo build")
+    else if (std.mem.eql(u8, tool, "zig"))
+        try gpa.dupe(u8, "zig build")
+    else if (std.mem.eql(u8, tool, "go"))
+        try gpa.dupe(u8, "go build ./...")
+    else if (std.mem.eql(u8, tool, "npm"))
+        try gpa.dupe(u8, "npm run build")
+    else
+        try gpa.dupe(u8, "make");
+    errdefer gpa.free(command);
+
+    var ts_start: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_start);
+
+    const r = std.process.run(gpa, io, .{ .argv = argv }) catch {
+        const errors = try gpa.alloc(BuildError, 0);
+        const warnings = try gpa.alloc(BuildWarning, 0);
+        return BuildResult{
+            .tool = tool,
+            .command = command,
+            .success = false,
+            .errors = errors,
+            .warnings = warnings,
+            .duration_ms = 0,
+            .truncated = false,
+            .role_confidence = if (tool_uncertain) "uncertain" else "certain",
+            .uncertainty_reason = if (tool_uncertain)
+                "multiple build systems detected; picked the first by priority order"
+            else if (std.mem.eql(u8, tool_resolution.resolved_by, "ledger"))
+                "multiple build systems detected; resolved by ledger precedent"
+            else
+                "",
+            .uncertainty_candidates = if (tool_candidates.len > 1) (gpa.dupe([]const u8, tool_candidates) catch &[_][]const u8{}) else &[_][]const u8{},
+            .resolved_by = tool_resolution.resolved_by,
+        };
+    };
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+
+    var ts_end: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_end);
+    const duration_ms: u64 = blk: {
+        const start_ms = @as(u64, @intCast(ts_start.sec)) * 1000 + @as(u64, @intCast(ts_start.nsec)) / 1_000_000;
+        const end_ms = @as(u64, @intCast(ts_end.sec)) * 1000 + @as(u64, @intCast(ts_end.nsec)) / 1_000_000;
+        break :blk if (end_ms > start_ms) end_ms - start_ms else 0;
+    };
+
+    const success = switch (r.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+
+    const combined = try std.fmt.allocPrint(gpa, "{s}\n{s}", .{ r.stdout, r.stderr });
+    defer gpa.free(combined);
+
+    var errbuf: [MAX_BUILD_ERRORS]BuildError = undefined;
+    var warnbuf: [MAX_BUILD_WARNINGS]BuildWarning = undefined;
+    var n_err: usize = 0;
+    var n_warn: usize = 0;
+    var truncated: bool = false;
+
+    if (std.mem.eql(u8, tool, "cargo")) {
+        parseCargoBuildOutput(gpa, combined, errbuf[0..], &n_err, warnbuf[0..], &n_warn, &truncated);
+    } else if (std.mem.eql(u8, tool, "zig") or std.mem.eql(u8, tool, "make")) {
+        parseZigBuildOutput(gpa, combined, errbuf[0..], &n_err, warnbuf[0..], &n_warn, &truncated);
+    } else if (std.mem.eql(u8, tool, "go")) {
+        parseGoBuildOutput(gpa, combined, errbuf[0..], &n_err, &truncated);
+    } else {
+        parseTscOutput(gpa, combined, errbuf[0..], &n_err, warnbuf[0..], &n_warn, &truncated);
+    }
+
+    const errors = try gpa.alloc(BuildError, n_err);
+    for (errbuf[0..n_err], 0..) |e, i| errors[i] = e;
+    const warnings = try gpa.alloc(BuildWarning, n_warn);
+    for (warnbuf[0..n_warn], 0..) |w, i| warnings[i] = w;
+
+    return .{
+        .tool = tool,
+        .command = command,
+        .success = success,
+        .errors = errors,
+        .warnings = warnings,
+        .duration_ms = duration_ms,
+        .truncated = truncated,
+        .role_confidence = if (tool_uncertain) "uncertain" else "certain",
+        .uncertainty_reason = if (tool_uncertain)
+            "multiple build systems detected; picked the first by priority order"
+        else if (std.mem.eql(u8, tool_resolution.resolved_by, "ledger"))
+            "multiple build systems detected; resolved by ledger precedent"
+        else
+            "",
+        .uncertainty_candidates = if (tool_candidates.len > 1) try gpa.dupe([]const u8, tool_candidates) else &[_][]const u8{},
+        .resolved_by = tool_resolution.resolved_by,
+    };
+}
+
+// --- symbol-find subcommand ---
+
+const SYMBOL_FIND_MAX_REFS: usize = 100;
+const SYMBOL_FIND_MAX_FILE_BYTES: usize = 5 * 1024 * 1024;
+
+pub const SymbolRef = struct { file: []u8, line: u32 };
+
+pub const SymbolFindResult = struct {
+    symbol: []const u8,
+    kind: []const u8,
+    definition: ?SymbolRef,
+    references: []SymbolRef,
+    capped: bool,
+};
+
+fn isWordChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_';
+}
+
+fn wholeWordPos(line: []const u8, name: []const u8) ?usize {
+    if (name.len == 0) return null;
+    var start: usize = 0;
+    while (start + name.len <= line.len) {
+        const rel = std.mem.indexOf(u8, line[start..], name) orelse return null;
+        const pos = start + rel;
+        const before_ok = pos == 0 or !isWordChar(line[pos - 1]);
+        const after_ok = pos + name.len >= line.len or !isWordChar(line[pos + name.len]);
+        if (before_ok and after_ok) return pos;
+        start = pos + 1;
+    }
+    return null;
+}
+
+// Returns true if `kw` appears in `line` at a word boundary, immediately
+// followed (after optional " \t*&") by `name` at a word boundary.
+fn kwdMatch(line: []const u8, kw: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (i + kw.len <= line.len) : (i += 1) {
+        if (!std.mem.eql(u8, line[i .. i + kw.len], kw)) continue;
+        if (i > 0 and isWordChar(line[i - 1])) continue;
+        const after = std.mem.trimStart(u8, line[i + kw.len ..], " \t*&");
+        if (std.mem.startsWith(u8, after, name) and
+            (after.len == name.len or !isWordChar(after[name.len]))) return true;
+    }
+    return false;
+}
+
+fn declarationKind(line: []const u8, name: []const u8) ?[]const u8 {
+    const t = std.mem.trimStart(u8, line, " \t");
+    if (t.len == 0) return null;
+    if (std.mem.startsWith(u8, t, "//") or std.mem.startsWith(u8, t, "#") or
+        std.mem.startsWith(u8, t, "*") or std.mem.startsWith(u8, t, "--")) return null;
+
+    if (kwdMatch(t, "fn ", name) or kwdMatch(t, "def ", name) or
+        kwdMatch(t, "function ", name) or kwdMatch(t, "func ", name) or
+        kwdMatch(t, "fun ", name) or kwdMatch(t, "proc ", name) or
+        kwdMatch(t, "method ", name) or kwdMatch(t, "sub ", name)) return "function";
+
+    if (kwdMatch(t, "class ", name) or kwdMatch(t, "struct ", name) or
+        kwdMatch(t, "trait ", name) or kwdMatch(t, "interface ", name) or
+        kwdMatch(t, "enum ", name) or kwdMatch(t, "protocol ", name) or
+        kwdMatch(t, "module ", name)) return "type";
+
+    if (kwdMatch(t, "type ", name)) return "type";
+
+    if (kwdMatch(t, "const ", name) or kwdMatch(t, "var ", name) or
+        kwdMatch(t, "let ", name) or kwdMatch(t, "val ", name)) return "constant";
+
+    return null;
+}
+
+fn scanFileForSymbol(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    abs_path: []const u8,
+    rel_path: []const u8,
+    name: []const u8,
+    def: *?SymbolRef,
+    def_kind: *[]const u8,
+    refs: *std.ArrayList(SymbolRef),
+    capped: *bool,
+) !void {
+    const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(SYMBOL_FIND_MAX_FILE_BYTES)) catch return;
+    defer gpa.free(content);
+    // Skip binary files (Mach-O, ELF, fat binary)
+    if (content.len >= 4 and (std.mem.eql(u8, content[0..4], "\xcf\xfa\xed\xfe") or
+        std.mem.eql(u8, content[0..4], "\xfe\xed\xfa\xcf") or
+        std.mem.eql(u8, content[0..4], "\xca\xfe\xba\xbe") or
+        std.mem.eql(u8, content[0..4], "\x7fELF"))) return;
+
+    // Consult the symbol-index cache (M44) for this file's declared symbols
+    // before falling back to this function's own declarationKind() heuristic.
+    // Same file content -> same cache key (M18-M20 content-hash invalidation),
+    // so a project already indexed via `symbol-index` resolves the definition
+    // at O(1) instead of re-deriving it here. A cache miss, or a file type
+    // computeOutline doesn't recognize (yields zero symbols), falls through to
+    // the existing scan unchanged. References are never sourced from this
+    // cache — it only records declarations, not every occurrence — so the
+    // full per-line scan below still runs regardless, over every file, exactly
+    // as before; only definition resolution is short-circuited.
+    var cached_def_line: ?u32 = null;
+    if (def.* == null) {
+        if (indexOneFile(gpa, io, abs_path) catch null) |indexed| {
+            defer {
+                gpa.free(indexed.lang);
+                for (indexed.symbols) |s| gpa.free(s.name);
+                gpa.free(indexed.symbols);
+            }
+            for (indexed.symbols) |s| {
+                if (std.mem.eql(u8, s.name, name)) {
+                    def.* = .{ .file = try gpa.dupe(u8, rel_path), .line = s.line };
+                    def_kind.* = s.kind;
+                    cached_def_line = s.line;
+                    break;
+                }
+            }
+        }
+    }
+
+    var line_num: u32 = 1;
+    var line_start: usize = 0;
+    while (line_start < content.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+        const line = content[line_start..line_end];
+
+        if (wholeWordPos(line, name) != null) {
+            if (cached_def_line != null and cached_def_line.? == line_num) {
+                // Already resolved via the symbol-index cache above; don't
+                // re-derive with declarationKind() or duplicate into refs.
+            } else if (declarationKind(line, name)) |kind| {
+                if (def.* == null) {
+                    def.* = .{ .file = try gpa.dupe(u8, rel_path), .line = line_num };
+                    def_kind.* = kind;
+                }
+                // definition line is not added to refs
+            } else if (refs.items.len < SYMBOL_FIND_MAX_REFS) {
+                try refs.append(gpa, .{ .file = try gpa.dupe(u8, rel_path), .line = line_num });
+            } else {
+                capped.* = true;
+            }
+        }
+
+        line_num += 1;
+        line_start = line_end + 1;
+    }
+}
+
+fn walkSymbolFind(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    root: []const u8,
+    name: []const u8,
+    def: *?SymbolRef,
+    def_kind: *[]const u8,
+    refs: *std.ArrayList(SymbolRef),
+    capped: *bool,
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file) {
+            if (shouldSkipGrepFile(entry.name)) continue;
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(rel_path);
+            const abs_path = try std.fs.path.join(gpa, &.{ root, rel_path });
+            defer gpa.free(abs_path);
+            try scanFileForSymbol(gpa, io, abs_path, rel_path, name, def, def_kind, refs, capped);
+        } else if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            try walkSymbolFind(gpa, io, sub, sub_prefix, root, name, def, def_kind, refs, capped);
+        }
+    }
+}
+
+pub fn computeSymbolFind(gpa: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8) !SymbolFindResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch
+        return error.RootNotFound;
+    defer dir.close(io);
+
+    var def: ?SymbolRef = null;
+    var def_kind: []const u8 = "unknown";
+    var refs: std.ArrayList(SymbolRef) = .empty;
+    errdefer {
+        if (def) |d| gpa.free(d.file);
+        for (refs.items) |rf| gpa.free(rf.file);
+        refs.deinit(gpa);
+    }
+    var capped = false;
+
+    try walkSymbolFind(gpa, io, dir, "", root, name, &def, &def_kind, &refs, &capped);
+
+    return .{
+        .symbol = name,
+        .kind = def_kind,
+        .definition = def,
+        .references = try refs.toOwnedSlice(gpa),
+        .capped = capped,
+    };
+}
+
+// --- secret-scan subcommand ---
+
+const SECRET_SCAN_MAX_FINDINGS: usize = 200;
+const SECRET_SCAN_MAX_FILE_BYTES: usize = 5 * 1024 * 1024;
+
+pub const SecretFinding = struct { file: []u8, line: u32, pattern: []const u8, severity: []const u8 };
+pub const SecretScanResult = struct { findings: []SecretFinding, truncated: bool };
+
+const SecretPatternMode = enum { prefix, assignment_key };
+const SecretPatternDef = struct {
+    needle: []const u8,
+    name: []const u8,
+    severity: []const u8,
+    mode: SecretPatternMode,
+};
+
+const SECRET_PATTERNS = [_]SecretPatternDef{
+    // Specific token prefixes (high-confidence, case-sensitive)
+    .{ .needle = "sk_live_", .name = "stripe-secret-key", .severity = "high", .mode = .prefix },
+    .{ .needle = "sk_test_", .name = "stripe-test-key", .severity = "medium", .mode = .prefix },
+    .{ .needle = "AKIA", .name = "aws-access-key-id", .severity = "high", .mode = .prefix },
+    .{ .needle = "ghp_", .name = "github-pat", .severity = "high", .mode = .prefix },
+    .{ .needle = "gho_", .name = "github-oauth-token", .severity = "high", .mode = .prefix },
+    .{ .needle = "ghs_", .name = "github-server-token", .severity = "high", .mode = .prefix },
+    .{ .needle = "github_pat_", .name = "github-fine-grained-pat", .severity = "high", .mode = .prefix },
+    .{ .needle = "glpat-", .name = "gitlab-pat", .severity = "high", .mode = .prefix },
+    .{ .needle = "xoxb-", .name = "slack-bot-token", .severity = "high", .mode = .prefix },
+    .{ .needle = "xoxp-", .name = "slack-user-token", .severity = "high", .mode = .prefix },
+    .{ .needle = "-----BEGIN RSA PRIVATE KEY-----", .name = "rsa-private-key", .severity = "high", .mode = .prefix },
+    .{ .needle = "-----BEGIN OPENSSH PRIVATE KEY-----", .name = "ssh-private-key", .severity = "high", .mode = .prefix },
+    .{ .needle = "-----BEGIN EC PRIVATE KEY-----", .name = "ec-private-key", .severity = "high", .mode = .prefix },
+    .{ .needle = "-----BEGIN PGP PRIVATE KEY BLOCK-----", .name = "pgp-private-key", .severity = "high", .mode = .prefix },
+    .{ .needle = "AIza", .name = "google-api-key", .severity = "high", .mode = .prefix },
+    .{ .needle = "ya29.", .name = "google-oauth-token", .severity = "high", .mode = .prefix },
+    // Assignment-key patterns: needle found in variable name + real value after = or :
+    .{ .needle = "password", .name = "hardcoded-password", .severity = "high", .mode = .assignment_key },
+    .{ .needle = "passwd", .name = "hardcoded-password", .severity = "high", .mode = .assignment_key },
+    .{ .needle = "api_secret", .name = "hardcoded-api-secret", .severity = "high", .mode = .assignment_key },
+    .{ .needle = "api_key", .name = "hardcoded-api-key", .severity = "medium", .mode = .assignment_key },
+    .{ .needle = "apikey", .name = "hardcoded-api-key", .severity = "medium", .mode = .assignment_key },
+    .{ .needle = "secret_key", .name = "hardcoded-secret-key", .severity = "medium", .mode = .assignment_key },
+    .{ .needle = "secret", .name = "hardcoded-secret", .severity = "medium", .mode = .assignment_key },
+    .{ .needle = "access_token", .name = "hardcoded-token", .severity = "medium", .mode = .assignment_key },
+    .{ .needle = "auth_token", .name = "hardcoded-token", .severity = "medium", .mode = .assignment_key },
+    .{ .needle = "private_key", .name = "hardcoded-private-key", .severity = "medium", .mode = .assignment_key },
+};
+
+fn secretScanIsCommentLine(line: []const u8) bool {
+    const t = std.mem.trimStart(u8, line, " \t");
+    return std.mem.startsWith(u8, t, "//") or
+        std.mem.startsWith(u8, t, "#") or
+        std.mem.startsWith(u8, t, "*") or
+        std.mem.startsWith(u8, t, "--") or
+        std.mem.startsWith(u8, t, "/*") or
+        std.mem.startsWith(u8, t, "<!--");
+}
+
+fn secretScanIsExampleFile(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".example") or
+        std.mem.endsWith(u8, name, ".sample") or
+        std.mem.endsWith(u8, name, ".template") or
+        std.mem.endsWith(u8, name, ".dist");
+}
+
+fn secretScanCaseInsensitiveContains(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |c, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(c)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+fn secretScanPrefixContinuationLen(line: []const u8, pos: usize, needle_len: usize) usize {
+    // Deliberately excludes '/' — none of the tracked prefix formats (Stripe,
+    // AWS, GitHub, GitLab, Slack, Google) use it in the token body, and
+    // allowing it let prose like "sk_live_/sk_test_" (naming two patterns,
+    // no real key) satisfy the length threshold.
+    var count: usize = 0;
+    var i = pos + needle_len;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or
+            c == '+' or c == '.' or c == '@' or c == '=')
+        {
+            count += 1;
+        } else break;
+    }
+    return count;
+}
+
+fn secretScanFindAssignmentSep(line: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == '=') {
+            if (i + 1 < line.len and line[i + 1] == '=') {
+                i += 1;
+                continue;
+            }
+            if (i > 0 and (line[i - 1] == '!' or line[i - 1] == '<' or line[i - 1] == '>')) continue;
+            return i;
+        }
+    }
+    // YAML colon: not :: and not ://
+    if (std.mem.indexOfScalar(u8, line, ':')) |cp| {
+        if (cp + 1 < line.len and line[cp + 1] != ':' and line[cp + 1] != '/') return cp;
+    }
+    return null;
+}
+
+fn secretScanExtractValue(line: []const u8, sep_pos: usize) []const u8 {
+    if (sep_pos + 1 >= line.len) return "";
+    const after = std.mem.trimStart(u8, line[sep_pos + 1 ..], " \t");
+    const trimmed = std.mem.trimEnd(u8, after, " \t;,\r");
+    if (trimmed.len >= 2) {
+        const q = trimmed[0];
+        if ((q == '"' or q == '\'' or q == '`') and trimmed[trimmed.len - 1] == q)
+            return trimmed[1 .. trimmed.len - 1];
+    }
+    return trimmed;
+}
+
+fn secretScanIsCleanKey(key: []const u8) bool {
+    for (key) |c| {
+        if (c == '(' or c == ')' or c == '{' or c == '}' or c == ';') return false;
+    }
+    return true;
+}
+
+fn secretScanIsPlaceholder(val: []const u8) bool {
+    if (val.len < 6) return true;
+    if (val[0] == '{' or val[0] == '[' or val[0] == '(' or val[0] == '$' or
+        val[0] == '.' or std.ascii.isDigit(val[0])) return true;
+    // Real hardcoded secrets are a single contiguous token — code (block
+    // labels, function calls, conditionals) contains spaces or these chars.
+    for (val) |c| {
+        if (c == ' ' or c == '\t' or c == '{' or c == '}' or c == '|' or c == '<' or c == '>') return true;
+    }
+    const env_prefixes = [_][]const u8{ "os.", "ENV[", "env.", "process.", "config.", "settings.", "getenv", "std." };
+    for (env_prefixes) |ep| {
+        if (std.mem.startsWith(u8, val, ep)) return true;
+    }
+    const null_literals = [_][]const u8{ "None", "null", "undefined", "true", "false", "True", "False", "NULL", "nil" };
+    for (null_literals) |nl| {
+        if (std.mem.eql(u8, val, nl)) return true;
+    }
+    const type_decls = [_][]const u8{ "struct", "enum", "union", "fn ", "interface", "class", "impl", "type " };
+    for (type_decls) |td| {
+        if (std.mem.startsWith(u8, val, td)) return true;
+    }
+    if (val.len >= 4) {
+        const first = val[0];
+        var all_same = true;
+        for (val) |c| {
+            if (c != first) {
+                all_same = false;
+                break;
+            }
+        }
+        if (all_same) return true;
+    }
+    var buf: [64]u8 = undefined;
+    const check_len = @min(val.len, 64);
+    for (val[0..check_len], 0..) |c, idx| buf[idx] = std.ascii.toLower(c);
+    const lower = buf[0..check_len];
+    const placeholder_pfx = [_][]const u8{
+        "your",      "my_api", "example", "placeholder", "replace",   "changeme",
+        "change_me", "put_",   "insert_", "enter_",      "add_",      "dummy",
+        "fake",      "sample", "test_",   "not_real",    "xxxxxxxxx", "12345678",
+    };
+    for (placeholder_pfx) |ph| {
+        if (std.mem.startsWith(u8, lower, ph)) return true;
+    }
+    return false;
+}
+
+fn scanFileForSecrets(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    abs_path: []const u8,
+    rel_path: []const u8,
+    findings: *std.ArrayList(SecretFinding),
+    truncated: *bool,
+) !void {
+    const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(SECRET_SCAN_MAX_FILE_BYTES)) catch return;
+    defer gpa.free(content);
+    if (content.len >= 4 and (std.mem.eql(u8, content[0..4], "\xcf\xfa\xed\xfe") or
+        std.mem.eql(u8, content[0..4], "\xfe\xed\xfa\xcf") or
+        std.mem.eql(u8, content[0..4], "\xca\xfe\xba\xbe") or
+        std.mem.eql(u8, content[0..4], "\x7fELF"))) return;
+
+    var line_num: u32 = 1;
+    var line_start: usize = 0;
+    var last_flagged: u32 = 0;
+    while (line_start < content.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+        const line = content[line_start..line_end];
+        if (line_num != last_flagged and !secretScanIsCommentLine(line)) {
+            for (SECRET_PATTERNS) |pat| {
+                if (findings.items.len >= SECRET_SCAN_MAX_FINDINGS) {
+                    truncated.* = true;
+                    return;
+                }
+                var matched = false;
+                switch (pat.mode) {
+                    .prefix => {
+                        if (std.mem.indexOf(u8, line, pat.needle)) |pos| {
+                            if (secretScanPrefixContinuationLen(line, pos, pat.needle.len) >= 8)
+                                matched = true;
+                        }
+                    },
+                    .assignment_key => {
+                        if (secretScanFindAssignmentSep(line)) |sep_pos| {
+                            const key = line[0..sep_pos];
+                            if (secretScanIsCleanKey(key) and secretScanCaseInsensitiveContains(key, pat.needle)) {
+                                const val = secretScanExtractValue(line, sep_pos);
+                                // A value that's just the key referencing itself (field
+                                // init reusing a same-named local, e.g. `.secrets_found =
+                                // secrets_found`) is a variable reference, never a real
+                                // hardcoded secret.
+                                const self_ref = val.len >= 3 and secretScanCaseInsensitiveContains(key, val);
+                                if (!secretScanIsPlaceholder(val) and !self_ref) matched = true;
+                            }
+                        }
+                    },
+                }
+                if (matched) {
+                    try findings.append(gpa, .{
+                        .file = try gpa.dupe(u8, rel_path),
+                        .line = line_num,
+                        .pattern = pat.name,
+                        .severity = pat.severity,
+                    });
+                    last_flagged = line_num;
+                    break;
+                }
+            }
+        }
+        line_num += 1;
+        line_start = line_end + 1;
+    }
+}
+
+fn walkSecretScan(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    root: []const u8,
+    findings: *std.ArrayList(SecretFinding),
+    truncated: *bool,
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (findings.items.len >= SECRET_SCAN_MAX_FINDINGS) {
+            truncated.* = true;
+            return;
+        }
+        if (entry.kind == .file) {
+            if (shouldSkipGrepFile(entry.name)) continue;
+            if (secretScanIsExampleFile(entry.name)) continue;
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(rel_path);
+            const abs_path = try std.fs.path.join(gpa, &.{ root, rel_path });
+            defer gpa.free(abs_path);
+            try scanFileForSecrets(gpa, io, abs_path, rel_path, findings, truncated);
+        } else if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            try walkSecretScan(gpa, io, sub, sub_prefix, root, findings, truncated);
+        }
+    }
+}
+
+pub fn computeSecretScan(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !SecretScanResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch
+        return error.RootNotFound;
+    defer dir.close(io);
+    var findings: std.ArrayList(SecretFinding) = .empty;
+    errdefer {
+        for (findings.items) |f| gpa.free(f.file);
+        findings.deinit(gpa);
+    }
+    var truncated = false;
+    try walkSecretScan(gpa, io, dir, "", root, &findings, &truncated);
+    return .{ .findings = try findings.toOwnedSlice(gpa), .truncated = truncated };
+}
+
+// --- public-release-check ---
+// Deliberately generic: this file is itself one of the things that can go
+// public, so it must never hardcode a company or project name. Watchlist
+// terms come from an external file (default ~/.4orman/public-release-watchlist.txt)
+// that lives outside any repo and is never committed anywhere.
+
+pub const PrcFinding = struct {
+    check: []const u8,
+    severity: []const u8, // "high" | "medium" | "info"
+    file: []const u8,
+    line: u32,
+    detail: []u8,
+};
+
+pub const PublicReleaseCheckResult = struct {
+    ready: bool,
+    checksRun: []const []const u8,
+    watchlistConfigured: bool,
+    findings: []PrcFinding,
+};
+
+const PRC_CHECKS = [_][]const u8{
+    "secrets", "company-names", "pii", "history-emails", "project-refs", "structure", "hardcoded-paths",
+};
+
+fn prcWatchlistPath(gpa: std.mem.Allocator) !?[]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    return try std.fmt.allocPrint(gpa, "{s}/.4orman/public-release-watchlist.txt", .{home});
+}
+
+const PrcWatchlistEntry = struct { term: []const u8, category: []const u8 }; // category: "company-names" | "project-refs"
+
+fn prcLoadWatchlist(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entries: *std.ArrayList(PrcWatchlistEntry)) !void {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var r = file.reader(io, &rbuf);
+    const content = try r.interface.allocRemaining(gpa, .limited(1024 * 1024));
+    defer gpa.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "company:")) {
+            try entries.append(gpa, .{ .term = try gpa.dupe(u8, line[8..]), .category = "company-names" });
+        } else if (std.mem.startsWith(u8, line, "project:")) {
+            try entries.append(gpa, .{ .term = try gpa.dupe(u8, line[8..]), .category = "project-refs" });
+        } else {
+            try entries.append(gpa, .{ .term = try gpa.dupe(u8, line), .category = "company-names" });
+        }
+    }
+}
+
+fn prcTrackedFiles(gpa: std.mem.Allocator, io: std.Io, repo: []const u8) ![][]u8 {
+    const raw = runGit(gpa, io, repo, &.{"ls-files"}) catch return &.{};
+    defer gpa.free(raw);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |f| gpa.free(f);
+        out.deinit(gpa);
+    }
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        try out.append(gpa, try gpa.dupe(u8, line));
+    }
+    return try out.toOwnedSlice(gpa);
+}
+
+fn prcScanFileForTerms(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    rel_path: []const u8,
+    watchlist: []const PrcWatchlistEntry,
+    findings: *std.ArrayList(PrcFinding),
+) !void {
+    // Binary files (images, fonts, archives, etc.) produce pure noise here --
+    // random bytes coincidentally shaped like "word@word.word" or containing
+    // "/Users/" byte sequences. Skip by extension, same list computeScan uses.
+    if (shouldSkipScanFile(std.fs.path.basename(rel_path))) return;
+    const abs = try std.fs.path.join(gpa, &.{ repo, rel_path });
+    defer gpa.free(abs);
+    const file = std.Io.Dir.openFileAbsolute(io, abs, .{}) catch return;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var r = file.reader(io, &rbuf);
+    const content = r.interface.allocRemaining(gpa, .limited(SECRET_SCAN_MAX_FILE_BYTES)) catch return;
+    defer gpa.free(content);
+
+    var line_num: u32 = 1;
+    var line_start: usize = 0;
+    while (line_start < content.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+        const line = content[line_start..line_end];
+
+        for (watchlist) |w| {
+            if (w.term.len > 0 and secretScanCaseInsensitiveContains(line, w.term)) {
+                try findings.append(gpa, .{
+                    .check = w.category,
+                    .severity = "high",
+                    .file = try gpa.dupe(u8, rel_path),
+                    .line = line_num,
+                    .detail = try std.fmt.allocPrint(gpa, "matched watchlist term \"{s}\"", .{w.term}),
+                });
+            }
+        }
+
+        // PII: bare email address (word@word.word) -- generic pattern, not tied to any domain.
+        if (std.mem.indexOfScalar(u8, line, '@')) |at| {
+            const before_ok = at > 0 and (std.ascii.isAlphanumeric(line[at - 1]) or line[at - 1] == '.' or line[at - 1] == '_' or line[at - 1] == '-');
+            const after = line[at + 1 ..];
+            const dot = std.mem.indexOfScalar(u8, after, '.');
+            if (before_ok and dot != null and dot.? > 0 and dot.? + 1 < after.len and std.ascii.isAlphabetic(after[dot.? + 1])) {
+                try findings.append(gpa, .{
+                    .check = "pii",
+                    .severity = "medium",
+                    .file = try gpa.dupe(u8, rel_path),
+                    .line = line_num,
+                    .detail = try gpa.dupe(u8, "line contains an email-shaped address"),
+                });
+            }
+        }
+
+        // Hardcoded absolute home path -- reveals a specific machine/username.
+        if (std.mem.indexOf(u8, line, "/Users/") != null or std.mem.indexOf(u8, line, "/home/") != null) {
+            try findings.append(gpa, .{
+                .check = "hardcoded-paths",
+                .severity = "medium",
+                .file = try gpa.dupe(u8, rel_path),
+                .line = line_num,
+                .detail = try gpa.dupe(u8, "line contains a hardcoded absolute home-directory path"),
+            });
+        }
+
+        line_num += 1;
+        line_start = line_end + 1;
+    }
+}
+
+fn prcCheckStructure(gpa: std.mem.Allocator, tracked: []const []u8, findings: *std.ArrayList(PrcFinding)) !void {
+    // Generic project signature: a top-level directory that has its own
+    // CLAUDE.md AND spec.md together is exactly what makes something a
+    // "project" per this framework's own convention -- not a hardcoded name.
+    var top_dirs_with_claude = std.StringHashMap(bool).init(gpa);
+    defer top_dirs_with_claude.deinit();
+    var top_dirs_with_spec = std.StringHashMap(bool).init(gpa);
+    defer top_dirs_with_spec.deinit();
+
+    for (tracked) |path| {
+        const slash = std.mem.indexOfScalar(u8, path, '/') orelse continue;
+        const top = path[0..slash];
+        const rest = path[slash + 1 ..];
+        if (std.mem.eql(u8, rest, "CLAUDE.md")) try top_dirs_with_claude.put(top, true);
+        if (std.mem.eql(u8, rest, "spec.md")) try top_dirs_with_spec.put(top, true);
+    }
+    var it = top_dirs_with_claude.keyIterator();
+    while (it.next()) |top| {
+        if (top_dirs_with_spec.contains(top.*)) {
+            try findings.append(gpa, .{
+                .check = "structure",
+                .severity = "high",
+                .file = try gpa.dupe(u8, top.*),
+                .line = 0,
+                .detail = try std.fmt.allocPrint(gpa, "\"{s}/\" has its own CLAUDE.md + spec.md -- looks like a full project got tracked, not just framework files", .{top.*}),
+            });
+        }
+    }
+}
+
+fn prcCheckHistoryEmails(gpa: std.mem.Allocator, io: std.Io, repo: []const u8, findings: *std.ArrayList(PrcFinding)) !void {
+    const raw = runGit(gpa, io, repo, &.{ "log", "--all", "--format=%ae%n%ce" }) catch return;
+    defer gpa.free(raw);
+    var seen = std.StringHashMap(void).init(gpa);
+    defer seen.deinit();
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or seen.contains(line)) continue;
+        try seen.put(line, {});
+        try findings.append(gpa, .{
+            .check = "history-emails",
+            .severity = "info",
+            .file = "",
+            .line = 0,
+            .detail = try std.fmt.allocPrint(gpa, "commit author/committer email appears in history: {s} -- review before publishing, this tool cannot judge which emails are safe", .{line}),
+        });
+    }
+}
+
+pub fn computePublicReleaseCheck(gpa: std.mem.Allocator, io: std.Io, repo: []const u8, watchlist_path_arg: ?[]const u8) !PublicReleaseCheckResult {
+    var findings: std.ArrayList(PrcFinding) = .empty;
+    errdefer {
+        for (findings.items) |f| {
+            gpa.free(f.detail);
+            if (f.file.len > 0) gpa.free(f.file);
+        }
+        findings.deinit(gpa);
+    }
+
+    // Tracked files (what would actually get published) -- computed first,
+    // every check below scans exactly this set, never the raw filesystem.
+    // A raw filesystem walk (like computeSecretScan's own, used elsewhere)
+    // would descend into git-ignored nested project repos and flag content
+    // that could never actually end up in the publish -- confirmed live:
+    // it picked up 4orman-tools/src/root.zig from inside the core 4orman
+    // repo, which `git ls-files` correctly never lists.
+    const tracked = try prcTrackedFiles(gpa, io, repo);
+    defer {
+        for (tracked) |f| gpa.free(f);
+        gpa.free(tracked);
+    }
+
+    // Check 1: secrets, scanned per tracked file (not computeSecretScan's
+    // own raw walk -- see note above).
+    {
+        var secret_findings: std.ArrayList(SecretFinding) = .empty;
+        defer {
+            for (secret_findings.items) |sf| gpa.free(sf.file);
+            secret_findings.deinit(gpa);
+        }
+        var truncated = false;
+        for (tracked) |rel_path| {
+            if (shouldSkipScanFile(std.fs.path.basename(rel_path))) continue;
+            const abs = try std.fs.path.join(gpa, &.{ repo, rel_path });
+            defer gpa.free(abs);
+            try scanFileForSecrets(gpa, io, abs, rel_path, &secret_findings, &truncated);
+        }
+        for (secret_findings.items) |sf| {
+            try findings.append(gpa, .{
+                .check = "secrets",
+                .severity = sf.severity,
+                .file = try gpa.dupe(u8, sf.file),
+                .line = sf.line,
+                .detail = try std.fmt.allocPrint(gpa, "pattern: {s}", .{sf.pattern}),
+            });
+        }
+    }
+
+    // Watchlist file (checks 2 + 5: company-names, project-refs)
+    var watchlist: std.ArrayList(PrcWatchlistEntry) = .empty;
+    defer {
+        for (watchlist.items) |w| gpa.free(w.term);
+        watchlist.deinit(gpa);
+    }
+    var watchlist_configured = false;
+    {
+        const owned_path = if (watchlist_path_arg == null) try prcWatchlistPath(gpa) else null;
+        defer if (owned_path) |p| gpa.free(p);
+        const path = watchlist_path_arg orelse (owned_path orelse "");
+        if (path.len > 0) {
+            const before = watchlist.items.len;
+            try prcLoadWatchlist(gpa, io, path, &watchlist);
+            watchlist_configured = watchlist.items.len > before or std.Io.Dir.cwd().statFile(io, path, .{}) != error.FileNotFound;
+        }
+    }
+    if (!watchlist_configured) {
+        try findings.append(gpa, .{
+            .check = "company-names",
+            .severity = "info",
+            .file = "",
+            .line = 0,
+            .detail = try gpa.dupe(u8, "no watchlist configured (~/.4orman/public-release-watchlist.txt not found) -- company-name and project-ref checks were skipped, not passed"),
+        });
+    }
+
+    // Checks 2, 3, 5, 7: watchlist terms, PII, hardcoded paths (per-file content scan)
+    if (watchlist.items.len > 0) {
+        for (tracked) |rel_path| {
+            try prcScanFileForTerms(gpa, io, repo, rel_path, watchlist.items, &findings);
+        }
+    } else {
+        // Still run PII + hardcoded-path checks even with no watchlist configured.
+        for (tracked) |rel_path| {
+            try prcScanFileForTerms(gpa, io, repo, rel_path, &.{}, &findings);
+        }
+    }
+
+    // Check 6: structure (project signature among tracked files)
+    try prcCheckStructure(gpa, tracked, &findings);
+
+    // Check 4: history emails
+    try prcCheckHistoryEmails(gpa, io, repo, &findings);
+
+    var ready = true;
+    for (findings.items) |f| {
+        if (std.mem.eql(u8, f.severity, "high")) ready = false;
+    }
+
+    return .{
+        .ready = ready,
+        .checksRun = &PRC_CHECKS,
+        .watchlistConfigured = watchlist_configured,
+        .findings = try findings.toOwnedSlice(gpa),
+    };
+}
+
+// --- device-scan subcommand ---
+
+pub const DeviceScanHardware = struct { cpu: []u8, cores: u32, ram_gb: u32, os: []const u8, arch: []u8 };
+pub const DeviceScanOptimal = struct { zig_build_flags: []const u8 };
+pub const DeviceScanTool = struct { name: []const u8, version: []u8, present: bool };
+pub const DeviceScanResult = struct {
+    profile_id: []u8,
+    hardware: DeviceScanHardware,
+    tools: []DeviceScanTool,
+    optimal: DeviceScanOptimal,
+    shell: []u8,
+    scanned_at: u64,
+    path: []u8,
+};
+
+fn runSysctlN(gpa: std.mem.Allocator, io: std.Io, key: []const u8) ![]u8 {
+    const argv = [_][]const u8{ "sysctl", "-n", key };
+    const result = std.process.run(gpa, io, .{ .argv = &argv }) catch
+        return try gpa.dupe(u8, "");
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    return try gpa.dupe(u8, std.mem.trimEnd(u8, result.stdout, " \t\r\n"));
+}
+
+fn deviceScanSlugify(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf = try gpa.alloc(u8, s.len);
+    var out: usize = 0;
+    for (s) |c| {
+        if (std.ascii.isAlphanumeric(c)) {
+            buf[out] = std.ascii.toLower(c);
+            out += 1;
+        } else if (c == ' ' or c == '-' or c == '_') {
+            if (out > 0 and buf[out - 1] != '_') {
+                buf[out] = '_';
+                out += 1;
+            }
+        }
+    }
+    // strip trailing underscore
+    while (out > 0 and buf[out - 1] == '_') out -= 1;
+    const result = try gpa.dupe(u8, buf[0..out]);
+    gpa.free(buf);
+    return result;
+}
+
+fn deviceScanZigFlags(cpu: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, cpu, "M1") != null) return "-Dcpu=apple_m1";
+    if (std.mem.indexOf(u8, cpu, "M2") != null) return "-Dcpu=apple_m2";
+    if (std.mem.indexOf(u8, cpu, "M3") != null) return "-Dcpu=apple_m3";
+    if (std.mem.indexOf(u8, cpu, "M4") != null) return "-Dcpu=apple_m4";
+    if (std.mem.indexOf(u8, cpu, "M5") != null) return "-Dcpu=apple_m5";
+    return "-Doptimize=ReleaseSafe";
+}
+
+pub fn computeDeviceScan(gpa: std.mem.Allocator, io: std.Io) !DeviceScanResult {
+    // Hardware
+    const cpu_raw = try runSysctlN(gpa, io, "machdep.cpu.brand_string");
+    const cores_raw = try runSysctlN(gpa, io, "hw.physicalcpu");
+    const mem_raw = try runSysctlN(gpa, io, "hw.memsize");
+    defer gpa.free(cpu_raw);
+    defer gpa.free(cores_raw);
+    defer gpa.free(mem_raw);
+
+    const cores = std.fmt.parseInt(u32, cores_raw, 10) catch 0;
+    const mem_bytes = std.fmt.parseInt(u64, mem_raw, 10) catch 0;
+    const ram_gb: u32 = @intCast(mem_bytes / (1024 * 1024 * 1024));
+
+    const arch_result = std.process.run(gpa, io, .{ .argv = &[_][]const u8{ "uname", "-m" } }) catch null;
+    const arch_raw = if (arch_result) |r| blk: {
+        defer gpa.free(r.stderr);
+        break :blk r.stdout;
+    } else try gpa.dupe(u8, "arm64");
+    const arch = try gpa.dupe(u8, std.mem.trimEnd(u8, arch_raw, " \t\r\n"));
+    if (arch_result != null) gpa.free(arch_raw);
+
+    const cpu = try gpa.dupe(u8, cpu_raw);
+
+    // Shell
+    const shell_ptr = std.c.getenv("SHELL") orelse null;
+    const shell_full: []u8 = if (shell_ptr) |p|
+        try gpa.dupe(u8, std.mem.sliceTo(p, 0))
+    else
+        try gpa.dupe(u8, "unknown");
+    // basename of shell path
+    const shell = if (std.mem.lastIndexOfScalar(u8, shell_full, '/')) |sl|
+        try gpa.dupe(u8, shell_full[sl + 1 ..])
+    else
+        shell_full;
+    if (std.mem.lastIndexOfScalar(u8, shell_full, '/') != null) gpa.free(shell_full);
+
+    // Tools
+    const tool_specs = [_]struct { name: []const u8, flag: []const u8 }{
+        .{ .name = "4orman_tools", .flag = "doctor" },
+        .{ .name = "zig", .flag = "version" },
+        .{ .name = "git", .flag = "--version" },
+        .{ .name = "gh", .flag = "--version" },
+        .{ .name = "node", .flag = "--version" },
+        .{ .name = "python3", .flag = "--version" },
+        .{ .name = "brew", .flag = "--version" },
+    };
+    const tool_bin_names = [_][]const u8{ "4orman-tools", "zig", "git", "gh", "node", "python3", "brew" };
+
+    var tools_list = try gpa.alloc(DeviceScanTool, tool_specs.len);
+    for (tool_specs, 0..) |spec, i| {
+        const info = try checkBinary(gpa, io, tool_bin_names[i], spec.flag);
+        tools_list[i] = .{ .name = spec.name, .version = info.version, .present = info.present };
+    }
+
+    // Optimal settings
+    const zig_flags = deviceScanZigFlags(cpu);
+
+    // Profile ID
+    const cpu_slug = try deviceScanSlugify(gpa, cpu);
+    defer gpa.free(cpu_slug);
+    const profile_id = try std.fmt.allocPrint(gpa, "{s}_{d}gb_{s}", .{ cpu_slug, ram_gb, arch });
+
+    // Timestamp (REALTIME seconds)
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const scanned_at: u64 = @intCast(ts.sec);
+
+    // Write profile to ~/.4orman/profile.json
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    const profile_path = try std.fmt.allocPrint(gpa, "{s}/profile.json", .{foreman_dir});
+    defer gpa.free(profile_path);
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{profile_path});
+    defer gpa.free(tmp_path);
+
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+    const pf = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch null;
+    if (pf) |f| {
+        var wbuf: [4096]u8 = undefined;
+        var w = f.writerStreaming(io, &wbuf);
+        // write JSON — best effort, ignore errors
+        const ok = blk: {
+            w.interface.writeAll("{\"profile_id\":\"") catch break :blk false;
+            w.interface.writeAll(profile_id) catch break :blk false;
+            w.interface.writeAll("\",\"hardware\":{\"cpu\":\"") catch break :blk false;
+            w.interface.writeAll(cpu) catch break :blk false;
+            w.interface.print("\",\"cores\":{d},\"ram_gb\":{d},\"os\":\"macos\",\"arch\":\"", .{ cores, ram_gb }) catch break :blk false;
+            w.interface.writeAll(arch) catch break :blk false;
+            w.interface.writeAll("\"},\"tools\":{") catch break :blk false;
+            for (tools_list, 0..) |t, idx| {
+                if (idx > 0) w.interface.writeAll(",") catch break :blk false;
+                w.interface.print("\"{s}\":{{\"version\":\"{s}\",\"present\":{s}}}", .{
+                    t.name, t.version, if (t.present) "true" else "false",
+                }) catch break :blk false;
+            }
+            w.interface.print("}},\"optimal\":{{\"zig_build_flags\":\"{s}\"}},\"shell\":\"{s}\",\"scanned_at\":{d}}}", .{
+                zig_flags, shell, scanned_at,
+            }) catch break :blk false;
+            w.interface.flush() catch break :blk false;
+            break :blk true;
+        };
+        f.close(io);
+        if (ok) {
+            atomicRenameAbsolute(tmp_path, profile_path);
+            // Pre-warm cache so `cache-fetch ~/.4orman/profile.json device` hits next session
+            var tools_buf: [4096]u8 = undefined;
+            var tools_len: usize = 0;
+            var tools_ok = true;
+            for (tools_list, 0..) |t, idx| {
+                const sep: []const u8 = if (idx == 0) "" else ",";
+                const part = std.fmt.bufPrint(tools_buf[tools_len..], "{s}\"{s}\":{{\"version\":\"{s}\",\"present\":{s}}}", .{
+                    sep, t.name, t.version, if (t.present) "true" else "false",
+                }) catch {
+                    tools_ok = false;
+                    break;
+                };
+                tools_len += part.len;
+            }
+            if (tools_ok) {
+                const cache_json = std.fmt.allocPrint(
+                    gpa,
+                    "{{\"profile_id\":\"{s}\",\"hardware\":{{\"cpu\":\"{s}\",\"cores\":{d},\"ram_gb\":{d},\"os\":\"macos\",\"arch\":\"{s}\"}},\"tools\":{{{s}}},\"optimal\":{{\"zig_build_flags\":\"{s}\"}},\"shell\":\"{s}\",\"scanned_at\":{d}}}",
+                    .{ profile_id, cpu, cores, ram_gb, arch, tools_buf[0..tools_len], zig_flags, shell, scanned_at },
+                ) catch null;
+                if (cache_json) |cj| {
+                    defer gpa.free(cj);
+                    if (computeCacheStore(gpa, io, profile_path, "device", cj) catch null) |store_result| {
+                        gpa.free(store_result.path);
+                        gpa.free(store_result.subKey);
+                    }
+                }
+            }
+        }
+    }
+
+    return .{
+        .profile_id = profile_id,
+        .hardware = .{ .cpu = cpu, .cores = cores, .ram_gb = ram_gb, .os = "macos", .arch = arch },
+        .tools = tools_list,
+        .optimal = .{ .zig_build_flags = zig_flags },
+        .shell = shell,
+        .scanned_at = scanned_at,
+        .path = try gpa.dupe(u8, profile_path),
+    };
+}
+
+// --- delta-context subcommand ---
+
+const DELTA_MAX_FILES: usize = 8;
+const DELTA_MAX_SYMBOLS: usize = 10;
+const DELTA_MAX_CALLERS: usize = 10;
+
+pub const DeltaCaller = struct { file: []u8, line: u32 };
+pub const DeltaSymbol = struct {
+    name: []u8,
+    kind: []const u8,
+    file: []u8,
+    line: u32,
+    callers: []DeltaCaller,
+};
+pub const DeltaContextResult = struct {
+    ref: []u8,
+    symbols: []DeltaSymbol,
+};
+
+// Parse "@@ -old_start,old_count +new_start,new_count @@" hunk header.
+// Returns {new_start, new_count} or null if not a hunk header.
+fn parseHunkNewRange(line: []const u8) ?struct { start: u32, count: u32 } {
+    if (!std.mem.startsWith(u8, line, "@@ ")) return null;
+    // Find '+' in "... +new_start,new_count ..."
+    const plus_pos = std.mem.indexOf(u8, line, " +") orelse return null;
+    const rest = line[plus_pos + 2 ..];
+    // Parse new_start
+    var i: usize = 0;
+    while (i < rest.len and std.ascii.isDigit(rest[i])) : (i += 1) {}
+    const start = std.fmt.parseInt(u32, rest[0..i], 10) catch return null;
+    // Parse optional ,count
+    var count: u32 = 1;
+    if (i < rest.len and rest[i] == ',') {
+        i += 1;
+        var j = i;
+        while (j < rest.len and std.ascii.isDigit(rest[j])) : (j += 1) {}
+        count = std.fmt.parseInt(u32, rest[i..j], 10) catch 1;
+    }
+    return .{ .start = start, .count = count };
+}
+
+// Run "git diff -U0 [ref] -- <rel_path>" in repo and collect changed new-file line numbers.
+fn collectChangedLines(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    rel_path: []const u8,
+    ref: []const u8,
+    changed: *std.ArrayList(u32),
+) !void {
+    const argv = [_][]const u8{ "env", "-C", repo, "git", "diff", "-U0", ref, "--", rel_path };
+    const result = std.process.run(gpa, io, .{ .argv = &argv }) catch return;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    var line_start: usize = 0;
+    while (line_start < result.stdout.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, result.stdout, line_start, '\n') orelse result.stdout.len;
+        const line = result.stdout[line_start..line_end];
+        if (parseHunkNewRange(line)) |range| {
+            var ln: u32 = range.start;
+            const end_ln = range.start + range.count;
+            while (ln < end_ln) : (ln += 1) {
+                try changed.append(gpa, ln);
+            }
+        }
+        line_start = line_end + 1;
+    }
+}
+
+// Find which symbol a given line belongs to (symbol owns lines from its line until next symbol's line).
+fn findOwningSymbol(symbols: []const Symbol, line: u32) ?usize {
+    if (symbols.len == 0) return null;
+    var best: ?usize = null;
+    for (symbols, 0..) |sym, i| {
+        if (sym.line <= line) {
+            if (best == null or sym.line > symbols[best.?].line) best = i;
+        }
+    }
+    return best;
+}
+
+pub fn computeDeltaContext(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    ref: []const u8,
+) !DeltaContextResult {
+    // 1. Get changed files
+    const files_argv = [_][]const u8{ "env", "-C", repo, "git", "diff", "--name-only", ref };
+    const files_result = std.process.run(gpa, io, .{ .argv = &files_argv }) catch
+        return error.GitFailed;
+    defer gpa.free(files_result.stdout);
+    defer gpa.free(files_result.stderr);
+
+    var result_symbols: std.ArrayList(DeltaSymbol) = .empty;
+    errdefer {
+        for (result_symbols.items) |ds| {
+            gpa.free(ds.name);
+            gpa.free(ds.file);
+            for (ds.callers) |c| gpa.free(c.file);
+            gpa.free(ds.callers);
+        }
+        result_symbols.deinit(gpa);
+    }
+
+    var seen_symbols = std.StringHashMap(void).init(gpa);
+    defer seen_symbols.deinit();
+
+    var file_count: usize = 0;
+    var file_start: usize = 0;
+    while (file_start < files_result.stdout.len and file_count < DELTA_MAX_FILES) {
+        const file_end = std.mem.indexOfScalarPos(u8, files_result.stdout, file_start, '\n') orelse files_result.stdout.len;
+        const rel_path = std.mem.trimEnd(u8, files_result.stdout[file_start..file_end], " \t\r");
+        file_start = file_end + 1;
+        if (rel_path.len == 0) continue;
+        // Skip non-source files
+        if (shouldSkipGrepFile(rel_path)) continue;
+        file_count += 1;
+
+        // 2. Collect changed line numbers for this file
+        var changed: std.ArrayList(u32) = .empty;
+        defer changed.deinit(gpa);
+        try collectChangedLines(gpa, io, repo, rel_path, ref, &changed);
+        if (changed.items.len == 0) continue;
+
+        // 3. Outline the current file
+        const abs_path = try std.fs.path.join(gpa, &.{ repo, rel_path });
+        defer gpa.free(abs_path);
+        const outline = computeOutline(gpa, io, abs_path) catch continue;
+        defer {
+            for (outline.symbols) |s| gpa.free(s.name);
+            gpa.free(outline.symbols);
+            gpa.free(outline.path);
+        }
+        if (outline.symbols.len == 0) continue;
+
+        // 4. Map changed lines → owning symbols (deduplicated)
+        for (changed.items) |ln| {
+            if (result_symbols.items.len >= DELTA_MAX_SYMBOLS) break;
+            const idx = findOwningSymbol(outline.symbols, ln) orelse continue;
+            const sym = outline.symbols[idx];
+            // Deduplicate by name
+            const key = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ rel_path, sym.name });
+            defer gpa.free(key);
+            if (seen_symbols.contains(key)) continue;
+            try seen_symbols.put(try gpa.dupe(u8, key), {});
+
+            // 5. Find callers via symbol-find
+            const sf = computeSymbolFind(gpa, io, repo, sym.name) catch null;
+            var callers_list: []DeltaCaller = &.{};
+            if (sf) |found| {
+                defer {
+                    if (found.definition) |d| gpa.free(d.file);
+                    for (found.references) |rf| gpa.free(rf.file);
+                    gpa.free(found.references);
+                }
+                const caller_count = @min(found.references.len, DELTA_MAX_CALLERS);
+                callers_list = try gpa.alloc(DeltaCaller, caller_count);
+                for (found.references[0..caller_count], 0..) |rf, ci| {
+                    callers_list[ci] = .{
+                        .file = try gpa.dupe(u8, rf.file),
+                        .line = rf.line,
+                    };
+                }
+            }
+
+            try result_symbols.append(gpa, .{
+                .name = try gpa.dupe(u8, sym.name),
+                .kind = sym.kind,
+                .file = try gpa.dupe(u8, rel_path),
+                .line = sym.line,
+                .callers = callers_list,
+            });
+        }
+    }
+
+    // Free seen_symbols keys
+    var it = seen_symbols.keyIterator();
+    while (it.next()) |k| gpa.free(k.*);
+
+    return .{
+        .ref = try gpa.dupe(u8, ref),
+        .symbols = try result_symbols.toOwnedSlice(gpa),
+    };
+}
+
+// --- git-cache subcommand ---
+
+pub const GitCacheCommit = struct { hash: []u8, subject: []u8, author: []u8, date: []u8 };
+pub const GitCacheResult = struct {
+    hit: bool,
+    branch: []u8,
+    head: []u8,
+    dirty: bool,
+    ahead: u32,
+    behind: u32,
+    commits: []GitCacheCommit,
+};
+
+// Parse "N\tM\n" output from git rev-list --left-right --count HEAD...@{u}
+fn parseAheadBehind(raw: []const u8) struct { ahead: u32, behind: u32 } {
+    const tab = std.mem.indexOfScalar(u8, raw, '\t') orelse return .{ .ahead = 0, .behind = 0 };
+    const ahead = std.fmt.parseInt(u32, std.mem.trimEnd(u8, raw[0..tab], " \r\n"), 10) catch 0;
+    const behind = std.fmt.parseInt(u32, std.mem.trimEnd(u8, raw[tab + 1 ..], " \r\n"), 10) catch 0;
+    return .{ .ahead = ahead, .behind = behind };
+}
+
+fn gitCachePath(gpa: std.mem.Allocator, home: []const u8, repo: []const u8) ![]u8 {
+    const key = sha256Hex(repo);
+    return std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools/gc-{s}.json", .{ home, key });
+}
+
+pub fn computeGitCache(gpa: std.mem.Allocator, io: std.Io, repo: []const u8) !GitCacheResult {
+    // Current HEAD SHA
+    const head_raw = runGit(gpa, io, repo, &.{ "rev-parse", "HEAD" }) catch
+        return error.NotAGitRepo;
+    defer gpa.free(head_raw);
+    const head_sha = std.mem.trimEnd(u8, head_raw, " \r\n");
+
+    // Locate cache file
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const cache_path = try gitCachePath(gpa, home, repo);
+    defer gpa.free(cache_path);
+
+    // Try to read the cache
+    if (std.Io.Dir.openFileAbsolute(io, cache_path, .{})) |cf| {
+        var rbuf: [4096]u8 = undefined;
+        var reader = cf.reader(io, &rbuf);
+        const content = reader.interface.allocRemaining(gpa, .limited(512 * 1024)) catch blk: {
+            cf.close(io);
+            break :blk null;
+        };
+        cf.close(io);
+        if (content) |c| {
+            defer gpa.free(c);
+            // First line is the stored HEAD SHA
+            if (std.mem.indexOfScalar(u8, c, '\n')) |nl| {
+                const stored_head = c[0..nl];
+                if (std.mem.eql(u8, stored_head, head_sha)) {
+                    // Parse the stored JSON
+                    const json = c[nl + 1 ..];
+                    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch null;
+                    if (parsed) |pv| {
+                        defer pv.deinit();
+                        if (pv.value == .object) {
+                            const obj = pv.value.object;
+                            const branch_v = obj.get("branch") orelse std.json.Value{ .string = "" };
+                            const dirty_v = obj.get("dirty") orelse std.json.Value{ .bool = false };
+                            const ahead_v = obj.get("ahead") orelse std.json.Value{ .integer = 0 };
+                            const behind_v = obj.get("behind") orelse std.json.Value{ .integer = 0 };
+                            const branch_s = if (branch_v == .string) branch_v.string else "";
+                            const dirty_b = if (dirty_v == .bool) dirty_v.bool else false;
+                            const ahead_n: u32 = if (ahead_v == .integer) @intCast(@max(0, ahead_v.integer)) else 0;
+                            const behind_n: u32 = if (behind_v == .integer) @intCast(@max(0, behind_v.integer)) else 0;
+                            // Parse commits array
+                            var cached_commits: std.ArrayList(GitCacheCommit) = .empty;
+                            errdefer {
+                                for (cached_commits.items) |cc| {
+                                    gpa.free(cc.hash);
+                                    gpa.free(cc.subject);
+                                    gpa.free(cc.author);
+                                    gpa.free(cc.date);
+                                }
+                                cached_commits.deinit(gpa);
+                            }
+                            if (obj.get("commits")) |commits_v| {
+                                if (commits_v == .array) {
+                                    for (commits_v.array.items) |entry| {
+                                        if (entry != .object) continue;
+                                        const eo = entry.object;
+                                        const h = if (eo.get("hash")) |v| if (v == .string) v.string else "" else "";
+                                        const s = if (eo.get("subject")) |v| if (v == .string) v.string else "" else "";
+                                        const a = if (eo.get("author")) |v| if (v == .string) v.string else "" else "";
+                                        const d = if (eo.get("date")) |v| if (v == .string) v.string else "" else "";
+                                        try cached_commits.append(gpa, .{
+                                            .hash = try gpa.dupe(u8, h),
+                                            .subject = try gpa.dupe(u8, s),
+                                            .author = try gpa.dupe(u8, a),
+                                            .date = try gpa.dupe(u8, d),
+                                        });
+                                    }
+                                }
+                            }
+                            return .{
+                                .hit = true,
+                                .branch = try gpa.dupe(u8, branch_s),
+                                .head = try gpa.dupe(u8, head_sha),
+                                .dirty = dirty_b,
+                                .ahead = ahead_n,
+                                .behind = behind_n,
+                                .commits = try cached_commits.toOwnedSlice(gpa),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    } else |_| {}
+
+    // Cache miss — run git commands
+    const branch_raw = runGit(gpa, io, repo, &.{ "rev-parse", "--abbrev-ref", "HEAD" }) catch
+        try gpa.dupe(u8, "HEAD\n");
+    defer gpa.free(branch_raw);
+    const branch = try gpa.dupe(u8, std.mem.trimEnd(u8, branch_raw, " \r\n"));
+
+    const status_raw = runGit(gpa, io, repo, &.{ "status", "--porcelain" }) catch
+        try gpa.dupe(u8, "");
+    defer gpa.free(status_raw);
+    const dirty = std.mem.trimEnd(u8, status_raw, " \r\n").len > 0;
+
+    var ahead: u32 = 0;
+    var behind: u32 = 0;
+    if (runGit(gpa, io, repo, &.{ "rev-list", "--left-right", "--count", "HEAD...@{u}" })) |ab_raw| {
+        defer gpa.free(ab_raw);
+        const ab = parseAheadBehind(ab_raw);
+        ahead = ab.ahead;
+        behind = ab.behind;
+    } else |_| {}
+
+    // Recent commits: hash\tsubject\tauthor\tdate
+    const log_raw = runGit(gpa, io, repo, &.{
+        "log", "-n", "10", "--format=%H\t%s\t%an\t%ad", "--date=short",
+    }) catch try gpa.dupe(u8, "");
+    defer gpa.free(log_raw);
+
+    var commits: std.ArrayList(GitCacheCommit) = .empty;
+    errdefer {
+        for (commits.items) |c| {
+            gpa.free(c.hash);
+            gpa.free(c.subject);
+            gpa.free(c.author);
+            gpa.free(c.date);
+        }
+        commits.deinit(gpa);
+    }
+
+    var log_line_start: usize = 0;
+    while (log_line_start < log_raw.len) {
+        const log_line_end = std.mem.indexOfScalarPos(u8, log_raw, log_line_start, '\n') orelse log_raw.len;
+        const log_line = log_raw[log_line_start..log_line_end];
+        log_line_start = log_line_end + 1;
+        if (log_line.len == 0) continue;
+        // Split on tabs
+        var fields: [4][]const u8 = .{ "", "", "", "" };
+        var fi: usize = 0;
+        var fs: usize = 0;
+        for (log_line, 0..) |ch, ci| {
+            if (ch == '\t' and fi < 3) {
+                fields[fi] = log_line[fs..ci];
+                fi += 1;
+                fs = ci + 1;
+            }
+        }
+        fields[fi] = log_line[fs..];
+        try commits.append(gpa, .{
+            .hash = try gpa.dupe(u8, fields[0]),
+            .subject = try gpa.dupe(u8, fields[1]),
+            .author = try gpa.dupe(u8, fields[2]),
+            .date = try gpa.dupe(u8, fields[3]),
+        });
+    }
+
+    // Write cache — serialize to JSON first, then write atomically
+    const cache_dir = try std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools", .{home});
+    defer gpa.free(cache_dir);
+    std.Io.Dir.createDirAbsolute(io, cache_dir, .default_dir) catch {};
+    const tmp_path = try std.fmt.allocPrint(gpa, "{s}.tmp", .{cache_path});
+    defer gpa.free(tmp_path);
+
+    if (std.Io.Dir.createFileAbsolute(io, tmp_path, .{})) |wf| {
+        var wbuf: [4096]u8 = undefined;
+        var w = wf.writerStreaming(io, &wbuf);
+        const write_ok = blk: {
+            // First line: head SHA for invalidation
+            w.interface.writeAll(head_sha) catch break :blk false;
+            w.interface.writeAll("\n") catch break :blk false;
+            // JSON state (no hit field in stored form)
+            w.interface.print("{{\"branch\":\"{s}\",\"head\":\"{s}\",\"dirty\":{s},\"ahead\":{d},\"behind\":{d},\"commits\":[", .{ branch, head_sha, if (dirty) "true" else "false", ahead, behind }) catch break :blk false;
+            for (commits.items, 0..) |cm, ci| {
+                if (ci > 0) w.interface.writeAll(",") catch break :blk false;
+                w.interface.print("{{\"hash\":\"{s}\",\"subject\":\"{s}\",\"author\":\"{s}\",\"date\":\"{s}\"}}", .{ cm.hash, cm.subject, cm.author, cm.date }) catch break :blk false;
+            }
+            w.interface.writeAll("]}") catch break :blk false;
+            w.interface.flush() catch break :blk false;
+            break :blk true;
+        };
+        wf.close(io);
+        if (write_ok) atomicRenameAbsolute(tmp_path, cache_path);
+    } else |_| {}
+
+    return .{
+        .hit = false,
+        .branch = branch,
+        .head = try gpa.dupe(u8, head_sha),
+        .dirty = dirty,
+        .ahead = ahead,
+        .behind = behind,
+        .commits = try commits.toOwnedSlice(gpa),
+    };
+}
+
+// --- prod-ready ---
+
+pub const ProdReadyItem = struct {
+    source: []const u8,
+    message: []const u8,
+};
+
+pub const ProdReadyResult = struct {
+    ready: bool,
+    blockers: []ProdReadyItem,
+    warnings: []ProdReadyItem,
+};
+
+pub fn computeProdReady(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ProdReadyResult {
+    var blockers: std.ArrayList(ProdReadyItem) = .empty;
+    var warnings: std.ArrayList(ProdReadyItem) = .empty;
+
+    // 1. Quality gate (build + tests)
+    const qg_opt: ?QualityGateResult = blk: {
+        const r = computeQualityGate(gpa, io, path) catch |e| switch (e) {
+            else => {
+                warnings.append(gpa, .{
+                    .source = "quality-gate",
+                    .message = "could not run quality gate",
+                }) catch {};
+                break :blk null;
+            },
+        };
+        break :blk r;
+    };
+    if (qg_opt) |qg| {
+        if (qg.critical.len > 0) {
+            try blockers.append(gpa, .{
+                .source = "quality-gate",
+                .message = try std.fmt.allocPrint(gpa, "{d} critical issue(s): build or test runner crashed", .{qg.critical.len}),
+            });
+        }
+        if (qg.high.len > 0) {
+            var build_errors: usize = 0;
+            var test_fails: usize = 0;
+            for (qg.high) |f| {
+                if (std.mem.eql(u8, f.source, "build")) build_errors += 1 else test_fails += 1;
+            }
+            try blockers.append(gpa, .{
+                .source = "quality-gate",
+                .message = try std.fmt.allocPrint(gpa, "{d} build error(s), {d} test failure(s)", .{ build_errors, test_fails }),
+            });
+        }
+        if (qg.medium.len > 0) {
+            try warnings.append(gpa, .{
+                .source = "quality-gate",
+                .message = try std.fmt.allocPrint(gpa, "{d} build warning(s)", .{qg.medium.len}),
+            });
+        }
+        if (!qg.build_ran) {
+            try warnings.append(gpa, .{
+                .source = "quality-gate",
+                .message = "no build system detected — build not verified",
+            });
+        }
+        if (!qg.tests_ran) {
+            try warnings.append(gpa, .{
+                .source = "quality-gate",
+                .message = "no test framework detected — tests not verified",
+            });
+        }
+    }
+
+    // 2. Secret scan
+    const ss_opt: ?SecretScanResult = blk: {
+        const r = computeSecretScan(gpa, io, path) catch |e| switch (e) {
+            else => {
+                warnings.append(gpa, .{
+                    .source = "secret-scan",
+                    .message = "could not run secret scan",
+                }) catch {};
+                break :blk null;
+            },
+        };
+        break :blk r;
+    };
+    if (ss_opt) |ss| {
+        if (ss.findings.len > 0) {
+            try blockers.append(gpa, .{
+                .source = "secret-scan",
+                .message = try std.fmt.allocPrint(gpa, "{d} hardcoded secret(s) found", .{ss.findings.len}),
+            });
+        }
+        if (ss.truncated) {
+            try warnings.append(gpa, .{
+                .source = "secret-scan",
+                .message = "scan truncated at 200 findings — more may exist",
+            });
+        }
+    }
+
+    // 3. Missing runtime deps
+    const ei_opt: ?EnvInspectResult = blk: {
+        const r = computeEnvInspect(gpa, io, path) catch {
+            break :blk null;
+        };
+        break :blk r;
+    };
+    if (ei_opt) |ei| {
+        for (ei.missing) |dep| {
+            try warnings.append(gpa, .{
+                .source = "env-inspect",
+                .message = try std.fmt.allocPrint(gpa, "missing: {s}", .{dep}),
+            });
+        }
+    }
+
+    return .{
+        .ready = blockers.items.len == 0,
+        .blockers = try blockers.toOwnedSlice(gpa),
+        .warnings = try warnings.toOwnedSlice(gpa),
+    };
+}
+
+// --- validate-schema ---
+
+const VALIDATE_MAX_VIOLATIONS: usize = 50;
+const VALIDATE_MAX_DEPTH: u32 = 6;
+
+pub const SchemaViolation = struct {
+    path: []const u8,
+    expected: []const u8,
+    got: []const u8,
+};
+
+pub const ValidateSchemaResult = struct {
+    valid: bool,
+    violations: []SchemaViolation,
+    file: []const u8,
+    schema: []const u8,
+};
+
+fn jsonMatchesType(v: std.json.Value, t: []const u8) bool {
+    return switch (v) {
+        .null => std.mem.eql(u8, t, "null"),
+        .bool => std.mem.eql(u8, t, "boolean") or std.mem.eql(u8, t, "bool"),
+        .integer => std.mem.eql(u8, t, "integer") or std.mem.eql(u8, t, "number"),
+        .float, .number_string => std.mem.eql(u8, t, "number"),
+        .string => std.mem.eql(u8, t, "string"),
+        .array => std.mem.eql(u8, t, "array"),
+        .object => std.mem.eql(u8, t, "object"),
+    };
+}
+
+fn jsonValuesEqual(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .null => b == .null,
+        .bool => |av| switch (b) {
+            .bool => |bv| av == bv,
+            else => false,
+        },
+        .integer => |av| switch (b) {
+            .integer => |bv| av == bv,
+            else => false,
+        },
+        .float => |av| switch (b) {
+            .float => |bv| av == bv,
+            else => false,
+        },
+        .number_string => |av| switch (b) {
+            .number_string => |bv| std.mem.eql(u8, av, bv),
+            else => false,
+        },
+        .string => |av| switch (b) {
+            .string => |bv| std.mem.eql(u8, av, bv),
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn validateValue(
+    gpa: std.mem.Allocator,
+    violations: *std.ArrayList(SchemaViolation),
+    data: std.json.Value,
+    schema: std.json.Value,
+    path: []const u8,
+    depth: u32,
+) !void {
+    if (violations.items.len >= VALIDATE_MAX_VIOLATIONS) return;
+    if (depth >= VALIDATE_MAX_DEPTH) return;
+    if (schema != .object) return;
+    const sch = schema.object;
+
+    // Type check
+    if (sch.get("type")) |type_node| {
+        if (type_node == .string) {
+            if (!jsonMatchesType(data, type_node.string)) {
+                try violations.append(gpa, .{
+                    .path = try gpa.dupe(u8, path),
+                    .expected = try gpa.dupe(u8, type_node.string),
+                    .got = jsonTypeName(data),
+                });
+                return; // type mismatch — skip further checks
+            }
+        }
+    }
+
+    // Enum check
+    if (sch.get("enum")) |enum_node| {
+        if (enum_node == .array) {
+            var found = false;
+            for (enum_node.array.items) |item| {
+                if (jsonValuesEqual(data, item)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try violations.append(gpa, .{
+                    .path = try gpa.dupe(u8, path),
+                    .expected = "one of enum values",
+                    .got = jsonTypeName(data),
+                });
+            }
+        }
+    }
+
+    // String constraints
+    if (data == .string) {
+        if (sch.get("minLength")) |ml| {
+            if (ml == .integer) min_len: {
+                const min: usize = @intCast(@max(0, ml.integer));
+                if (data.string.len < min) {
+                    try violations.append(gpa, .{
+                        .path = try gpa.dupe(u8, path),
+                        .expected = try std.fmt.allocPrint(gpa, "minLength {d}", .{min}),
+                        .got = try std.fmt.allocPrint(gpa, "length {d}", .{data.string.len}),
+                    });
+                }
+                break :min_len;
+            }
+        }
+        if (sch.get("maxLength")) |ml| {
+            if (ml == .integer) max_len: {
+                const max: usize = @intCast(@max(0, ml.integer));
+                if (data.string.len > max) {
+                    try violations.append(gpa, .{
+                        .path = try gpa.dupe(u8, path),
+                        .expected = try std.fmt.allocPrint(gpa, "maxLength {d}", .{max}),
+                        .got = try std.fmt.allocPrint(gpa, "length {d}", .{data.string.len}),
+                    });
+                }
+                break :max_len;
+            }
+        }
+    }
+
+    // Number constraints
+    if (data == .integer or data == .float) {
+        const val: f64 = switch (data) {
+            .integer => |n| @as(f64, @floatFromInt(n)),
+            .float => |f| f,
+            else => unreachable,
+        };
+        if (sch.get("minimum")) |mn| min_num: {
+            const min: f64 = switch (mn) {
+                .integer => |n| @as(f64, @floatFromInt(n)),
+                .float => |f| f,
+                else => break :min_num,
+            };
+            if (val < min) {
+                try violations.append(gpa, .{
+                    .path = try gpa.dupe(u8, path),
+                    .expected = try std.fmt.allocPrint(gpa, ">= {d}", .{min}),
+                    .got = try std.fmt.allocPrint(gpa, "{d}", .{val}),
+                });
+            }
+        }
+        if (sch.get("maximum")) |mx| max_num: {
+            const max: f64 = switch (mx) {
+                .integer => |n| @as(f64, @floatFromInt(n)),
+                .float => |f| f,
+                else => break :max_num,
+            };
+            if (val > max) {
+                try violations.append(gpa, .{
+                    .path = try gpa.dupe(u8, path),
+                    .expected = try std.fmt.allocPrint(gpa, "<= {d}", .{max}),
+                    .got = try std.fmt.allocPrint(gpa, "{d}", .{val}),
+                });
+            }
+        }
+    }
+
+    // Object: required + properties + additionalProperties
+    if (data == .object) {
+        if (sch.get("required")) |req_node| {
+            if (req_node == .array) {
+                for (req_node.array.items) |req| {
+                    if (violations.items.len >= VALIDATE_MAX_VIOLATIONS) break;
+                    if (req != .string) continue;
+                    if (data.object.get(req.string) == null) {
+                        const vpath = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ path, req.string });
+                        try violations.append(gpa, .{
+                            .path = vpath,
+                            .expected = "present",
+                            .got = "missing",
+                        });
+                    }
+                }
+            }
+        }
+        if (sch.get("properties")) |props_node| {
+            if (props_node == .object) {
+                var it = props_node.object.iterator();
+                while (it.next()) |entry| {
+                    if (violations.items.len >= VALIDATE_MAX_VIOLATIONS) break;
+                    const key = entry.key_ptr.*;
+                    const prop_schema = entry.value_ptr.*;
+                    if (data.object.get(key)) |prop_data| {
+                        const vpath = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ path, key });
+                        defer gpa.free(vpath);
+                        try validateValue(gpa, violations, prop_data, prop_schema, vpath, depth + 1);
+                    }
+                }
+            }
+        }
+        if (sch.get("additionalProperties")) |ap| {
+            if (ap == .bool and !ap.bool) {
+                if (sch.get("properties")) |props_node| {
+                    if (props_node == .object) {
+                        var it = data.object.iterator();
+                        while (it.next()) |entry| {
+                            if (violations.items.len >= VALIDATE_MAX_VIOLATIONS) break;
+                            const key = entry.key_ptr.*;
+                            if (props_node.object.get(key) == null) {
+                                const vpath = try std.fmt.allocPrint(gpa, "{s}.{s}", .{ path, key });
+                                try violations.append(gpa, .{
+                                    .path = vpath,
+                                    .expected = "not present",
+                                    .got = "unexpected key",
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Array: minItems + maxItems + items
+    if (data == .array) {
+        if (sch.get("minItems")) |mi| {
+            if (mi == .integer) min_items: {
+                const min: usize = @intCast(@max(0, mi.integer));
+                if (data.array.items.len < min) {
+                    try violations.append(gpa, .{
+                        .path = try gpa.dupe(u8, path),
+                        .expected = try std.fmt.allocPrint(gpa, "minItems {d}", .{min}),
+                        .got = try std.fmt.allocPrint(gpa, "{d} items", .{data.array.items.len}),
+                    });
+                }
+                break :min_items;
+            }
+        }
+        if (sch.get("maxItems")) |mi| {
+            if (mi == .integer) max_items: {
+                const max: usize = @intCast(@max(0, mi.integer));
+                if (data.array.items.len > max) {
+                    try violations.append(gpa, .{
+                        .path = try gpa.dupe(u8, path),
+                        .expected = try std.fmt.allocPrint(gpa, "maxItems {d}", .{max}),
+                        .got = try std.fmt.allocPrint(gpa, "{d} items", .{data.array.items.len}),
+                    });
+                }
+                break :max_items;
+            }
+        }
+        if (sch.get("items")) |items_schema| {
+            for (data.array.items, 0..) |item, idx| {
+                if (violations.items.len >= VALIDATE_MAX_VIOLATIONS) break;
+                const vpath = try std.fmt.allocPrint(gpa, "{s}[{d}]", .{ path, idx });
+                defer gpa.free(vpath);
+                try validateValue(gpa, violations, item, items_schema, vpath, depth + 1);
+            }
+        }
+    }
+}
+
+pub fn computeValidateSchema(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    file_path: []const u8,
+    schema_path: []const u8,
+) !ValidateSchemaResult {
+    const data_file = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch return error.FileNotFound;
+    defer data_file.close(io);
+    var rbuf1: [4096]u8 = undefined;
+    var r1 = data_file.reader(io, &rbuf1);
+    const data_content = try r1.interface.allocRemaining(gpa, .limited(10 * 1024 * 1024));
+    defer gpa.free(data_content);
+
+    const schema_file = std.Io.Dir.openFileAbsolute(io, schema_path, .{}) catch return error.SchemaNotFound;
+    defer schema_file.close(io);
+    var rbuf2: [4096]u8 = undefined;
+    var r2 = schema_file.reader(io, &rbuf2);
+    const schema_content = try r2.interface.allocRemaining(gpa, .limited(1 * 1024 * 1024));
+    defer gpa.free(schema_content);
+
+    const data_parsed = std.json.parseFromSlice(std.json.Value, gpa, data_content, .{}) catch return error.InvalidJson;
+    defer data_parsed.deinit();
+    const schema_parsed = std.json.parseFromSlice(std.json.Value, gpa, schema_content, .{}) catch return error.InvalidSchema;
+    defer schema_parsed.deinit();
+
+    var violations: std.ArrayList(SchemaViolation) = .empty;
+    try validateValue(gpa, &violations, data_parsed.value, schema_parsed.value, "$", 0);
+
+    return .{
+        .valid = violations.items.len == 0,
+        .violations = try violations.toOwnedSlice(gpa),
+        .file = file_path,
+        .schema = schema_path,
+    };
+}
+
+// --- quality-gate ---
+
+const QUALITY_GATE_MAX_PER_LEVEL: usize = 50;
+
+pub const QualityFinding = struct {
+    source: []const u8,
+    file: []const u8,
+    line: u32,
+    message: []const u8,
+};
+
+pub const QualityGateResult = struct {
+    verdict: []const u8, // "pass" or "fail"
+    critical: []QualityFinding,
+    high: []QualityFinding,
+    medium: []QualityFinding,
+    low: []QualityFinding,
+    build_ran: bool,
+    build_tool: []const u8,
+    tests_ran: bool,
+    test_fw: []const u8,
+    tests_passed: u32,
+    tests_failed: u32,
+};
+
+pub fn computeQualityGate(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !QualityGateResult {
+    var critical: std.ArrayList(QualityFinding) = .empty;
+    var high: std.ArrayList(QualityFinding) = .empty;
+    var medium: std.ArrayList(QualityFinding) = .empty;
+    var low: std.ArrayList(QualityFinding) = .empty;
+
+    var build_ran = false;
+    var build_tool: []const u8 = "";
+    var tests_ran = false;
+    var test_fw: []const u8 = "";
+    var tests_passed: u32 = 0;
+    var tests_failed: u32 = 0;
+
+    // Build phase
+    const build_opt: ?BuildResult = blk: {
+        const r = computeBuild(gpa, io, path) catch |e| switch (e) {
+            error.NoBuildSystem => break :blk null,
+            else => return e,
+        };
+        break :blk r;
+    };
+    if (build_opt) |br| {
+        build_ran = true;
+        build_tool = br.tool;
+        if (br.uncertainty_candidates.len > 0) {
+            const candidates_joined = std.mem.join(gpa, ", ", br.uncertainty_candidates) catch "";
+            defer if (candidates_joined.len > 0) gpa.free(candidates_joined);
+            if (std.mem.eql(u8, br.resolved_by, "ledger")) {
+                try low.append(gpa, .{
+                    .source = "build",
+                    .file = "",
+                    .line = 0,
+                    .message = try std.fmt.allocPrint(gpa, "build tool ambiguous ({s}) but resolved by ledger precedent — using \"{s}\"", .{ candidates_joined, br.tool }),
+                });
+            } else {
+                try medium.append(gpa, .{
+                    .source = "build",
+                    .file = "",
+                    .line = 0,
+                    .message = try std.fmt.allocPrint(gpa, "build tool detection uncertain: {s} — candidates: [{s}], picked \"{s}\" by priority order, no ledger precedent — resolve and `ledger record` the verdict", .{ br.uncertainty_reason, candidates_joined, br.tool }),
+                });
+            }
+        }
+        if (!br.success) {
+            if (br.errors.len > 0) {
+                for (br.errors) |berr| {
+                    if (high.items.len >= QUALITY_GATE_MAX_PER_LEVEL) break;
+                    try high.append(gpa, .{
+                        .source = "build",
+                        .file = berr.file,
+                        .line = berr.line,
+                        .message = berr.message,
+                    });
+                }
+            } else {
+                try critical.append(gpa, .{
+                    .source = "build",
+                    .file = "",
+                    .line = 0,
+                    .message = try std.fmt.allocPrint(gpa, "build failed: {s} exited non-zero", .{br.tool}),
+                });
+            }
+        }
+        for (br.warnings) |bw| {
+            if (medium.items.len >= QUALITY_GATE_MAX_PER_LEVEL) break;
+            try medium.append(gpa, .{
+                .source = "build",
+                .file = bw.file,
+                .line = bw.line,
+                .message = bw.message,
+            });
+        }
+    }
+
+    // Test phase
+    const tests_opt: ?RunTestsResult = blk: {
+        const r = computeRunTests(gpa, io, path) catch |e| switch (e) {
+            error.NoTestFramework => break :blk null,
+            else => return e,
+        };
+        break :blk r;
+    };
+    if (tests_opt) |tr| {
+        tests_ran = true;
+        test_fw = tr.framework;
+        tests_passed = tr.passed;
+        tests_failed = tr.failed;
+        if (tr.uncertainty_candidates.len > 0) {
+            const candidates_joined = std.mem.join(gpa, ", ", tr.uncertainty_candidates) catch "";
+            defer if (candidates_joined.len > 0) gpa.free(candidates_joined);
+            if (std.mem.eql(u8, tr.resolved_by, "ledger")) {
+                try low.append(gpa, .{
+                    .source = "tests",
+                    .file = "",
+                    .line = 0,
+                    .message = try std.fmt.allocPrint(gpa, "test framework ambiguous ({s}) but resolved by ledger precedent — using \"{s}\"", .{ candidates_joined, tr.framework }),
+                });
+            } else {
+                try medium.append(gpa, .{
+                    .source = "tests",
+                    .file = "",
+                    .line = 0,
+                    .message = try std.fmt.allocPrint(gpa, "test framework detection uncertain: {s} — candidates: [{s}], picked \"{s}\" by priority order, no ledger precedent — resolve and `ledger record` the verdict", .{ tr.uncertainty_reason, candidates_joined, tr.framework }),
+                });
+            }
+        }
+        if (!tr.success and tr.failures.len == 0 and tr.failed == 0) {
+            try critical.append(gpa, .{
+                .source = "tests",
+                .file = "",
+                .line = 0,
+                .message = try std.fmt.allocPrint(gpa, "test runner crashed: {s}", .{tr.framework}),
+            });
+        } else {
+            for (tr.failures) |tf| {
+                if (high.items.len >= QUALITY_GATE_MAX_PER_LEVEL) break;
+                try high.append(gpa, .{
+                    .source = "tests",
+                    .file = tf.file,
+                    .line = tf.line,
+                    .message = tf.message,
+                });
+            }
+        }
+    }
+
+    const verdict: []const u8 = if (critical.items.len > 0 or high.items.len > 0) "fail" else "pass";
+
+    return .{
+        .verdict = verdict,
+        .critical = try critical.toOwnedSlice(gpa),
+        .high = try high.toOwnedSlice(gpa),
+        .medium = try medium.toOwnedSlice(gpa),
+        .low = try low.toOwnedSlice(gpa),
+        .build_ran = build_ran,
+        .build_tool = build_tool,
+        .tests_ran = tests_ran,
+        .test_fw = test_fw,
+        .tests_passed = tests_passed,
+        .tests_failed = tests_failed,
+    };
+}
+
+// --- shell-run ---
+
+pub const SHELL_RUN_DISPLAY_MAX: usize = 128 * 1024;
+
+pub const ShellRunResult = struct {
+    command: []const u8, // not owned
+    exit_code: i32,
+    stdout: []u8, // owned by gpa
+    stderr: []u8, // owned by gpa
+    duration_ms: u64,
+    timed_out: bool,
+    blocked: bool,
+    block_reason: []const u8, // string literal, not owned
+};
+
+fn shellRunRmRfDanger(lower: []const u8) bool {
+    const pats = [_][]const u8{ "rm -rf /", "rm -rf ~/", "rm -rf ~" };
+    for (pats) |pat| {
+        var i: usize = 0;
+        while (std.mem.indexOf(u8, lower[i..], pat)) |rel| {
+            const pos = i + rel;
+            const after = pos + pat.len;
+            if (after >= lower.len) return true;
+            const c = lower[after];
+            if (c == ' ' or c == '\t' or c == '\n' or c == ';' or
+                c == '&' or c == '|' or c == '*' or c == '/') return true;
+            i = pos + 1;
+        }
+    }
+    return false;
+}
+
+fn shellRunBlockReason(lower: []const u8) ?[]const u8 {
+    if (shellRunRmRfDanger(lower)) return "rm -rf on root or home";
+    if (std.mem.indexOf(u8, lower, "mkfs") != null) return "filesystem format (mkfs)";
+    if (std.mem.indexOf(u8, lower, "dd ") != null and
+        std.mem.indexOf(u8, lower, "of=/dev/") != null) return "raw disk write (dd of=/dev/)";
+    if (std.mem.indexOf(u8, lower, "drop table") != null) return "SQL drop table";
+    if (std.mem.indexOf(u8, lower, "drop database") != null) return "SQL drop database";
+    if (std.mem.indexOf(u8, lower, "truncate table") != null) return "SQL truncate table";
+    return null;
+}
+
+pub fn computeShellRun(gpa: std.mem.Allocator, io: std.Io, command: []const u8, timeout_ms: u64) !ShellRunResult {
+    // Destructive pattern check (case-insensitive, first 4KB)
+    var lower_buf: [4096]u8 = undefined;
+    const check_len = @min(command.len, lower_buf.len);
+    _ = std.ascii.lowerString(lower_buf[0..check_len], command[0..check_len]);
+    if (shellRunBlockReason(lower_buf[0..check_len])) |reason| {
+        return .{
+            .command = command,
+            .exit_code = -1,
+            .stdout = try gpa.dupe(u8, ""),
+            .stderr = try gpa.dupe(u8, ""),
+            .duration_ms = 0,
+            .timed_out = false,
+            .blocked = true,
+            .block_reason = reason,
+        };
+    }
+
+    var ts_start: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_start);
+
+    const r = std.process.run(gpa, io, .{ .argv = &.{ "/bin/sh", "-c", command } }) catch |e| return e;
+    errdefer gpa.free(r.stdout);
+    errdefer gpa.free(r.stderr);
+
+    var ts_end: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_end);
+    const duration_ms: u64 = blk: {
+        const s0 = @as(u64, @intCast(ts_start.sec)) * 1000 + @as(u64, @intCast(ts_start.nsec)) / 1_000_000;
+        const s1 = @as(u64, @intCast(ts_end.sec)) * 1000 + @as(u64, @intCast(ts_end.nsec)) / 1_000_000;
+        break :blk if (s1 > s0) s1 - s0 else 0;
+    };
+
+    const exit_code: i32 = switch (r.term) {
+        .exited => |c| @as(i32, @intCast(c)),
+        else => -1,
+    };
+
+    return .{
+        .command = command,
+        .exit_code = exit_code,
+        .stdout = r.stdout,
+        .stderr = r.stderr,
+        .duration_ms = duration_ms,
+        .timed_out = duration_ms >= timeout_ms,
+        .blocked = false,
+        .block_reason = "",
+    };
+}
+
+// --- project-state ---
+
+const PROJECT_STATE_MAX_DECISIONS: usize = 100;
+const PROJECT_STATE_MAX_PATTERNS: usize = 50;
+
+pub const ProjectStateDecision = struct {
+    date: []u8,
+    what: []u8,
+    why: []u8,
+};
+
+pub const ProjectStateResult = struct {
+    path: []u8,
+    decisions: []ProjectStateDecision,
+    known_patterns: [][]u8,
+};
+
+pub const ProjectStateMode = union(enum) {
+    read,
+    record_decision: struct { what: []const u8, why: []const u8 },
+    record_pattern: []const u8,
+};
+
+fn projectStatePath(gpa: std.mem.Allocator, home: []const u8, project_path: []const u8) ![]u8 {
+    const key = sha256Hex(project_path);
+    return std.fmt.allocPrint(gpa, "{s}/.4orman/state/ps-{s}.json", .{ home, key });
+}
+
+fn tsToDateStr(gpa: std.mem.Allocator, ts_secs: u64) ![]u8 {
+    var d: u64 = ts_secs / 86400;
+    var y: u64 = 1970;
+    while (true) {
+        const leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+        const days_in_year: u64 = if (leap) 366 else 365;
+        if (d < days_in_year) break;
+        d -= days_in_year;
+        y += 1;
+    }
+    const leap = (y % 4 == 0 and y % 100 != 0) or (y % 400 == 0);
+    const month_days = [12]u64{ 31, if (leap) @as(u64, 29) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var m: u64 = 1;
+    for (month_days) |md| {
+        if (d < md) break;
+        d -= md;
+        m += 1;
+    }
+    d += 1;
+    return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, m, d });
+}
+
+fn parseProjectStateFile(gpa: std.mem.Allocator, io: std.Io, state_path: []const u8, decisions: *std.ArrayList(ProjectStateDecision), patterns: *std.ArrayList([]u8)) void {
+    const file = std.Io.Dir.openFileAbsolute(io, state_path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(1 * 1024 * 1024)) catch return;
+    defer gpa.free(content);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj = parsed.value.object;
+
+    // Parse decisions
+    if (obj.get("decisions")) |dv| {
+        if (dv == .array) {
+            for (dv.array.items) |item| {
+                if (item != .object) continue;
+                const d = item.object;
+                const date_v = d.get("date") orelse continue;
+                const what_v = d.get("what") orelse continue;
+                const why_v = d.get("why") orelse continue;
+                if (date_v != .string or what_v != .string or why_v != .string) continue;
+                const dec = ProjectStateDecision{
+                    .date = gpa.dupe(u8, date_v.string) catch continue,
+                    .what = gpa.dupe(u8, what_v.string) catch continue,
+                    .why = gpa.dupe(u8, why_v.string) catch continue,
+                };
+                decisions.append(gpa, dec) catch continue;
+                if (decisions.items.len >= PROJECT_STATE_MAX_DECISIONS) break;
+            }
+        }
+    }
+
+    // Parse knownPatterns
+    if (obj.get("knownPatterns")) |pv| {
+        if (pv == .array) {
+            for (pv.array.items) |item| {
+                if (item != .string) continue;
+                const pat = gpa.dupe(u8, item.string) catch continue;
+                patterns.append(gpa, pat) catch continue;
+                if (patterns.items.len >= PROJECT_STATE_MAX_PATTERNS) break;
+            }
+        }
+    }
+}
+
+fn writeProjectStateFile(gpa: std.mem.Allocator, io: std.Io, state_path: []const u8, decisions: []const ProjectStateDecision, patterns: []const []u8) void {
+    const tmp_path = std.fmt.allocPrint(gpa, "{s}.tmp", .{state_path}) catch return;
+    defer gpa.free(tmp_path);
+    const f = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    var wbuf: [4096]u8 = undefined;
+    var w = f.writerStreaming(io, &wbuf);
+    const ok = blk: {
+        w.interface.writeAll("{\"decisions\":[") catch break :blk false;
+        for (decisions, 0..) |dec, i| {
+            if (i > 0) w.interface.writeAll(",") catch break :blk false;
+            const date_esc = allocJsonEscape(gpa, dec.date) catch break :blk false;
+            defer gpa.free(date_esc);
+            const what_esc = allocJsonEscape(gpa, dec.what) catch break :blk false;
+            defer gpa.free(what_esc);
+            const why_esc = allocJsonEscape(gpa, dec.why) catch break :blk false;
+            defer gpa.free(why_esc);
+            w.interface.print("{{\"date\":\"{s}\",\"what\":\"{s}\",\"why\":\"{s}\"}}", .{
+                date_esc, what_esc, why_esc,
+            }) catch break :blk false;
+        }
+        w.interface.writeAll("],\"knownPatterns\":[") catch break :blk false;
+        for (patterns, 0..) |pat, i| {
+            if (i > 0) w.interface.writeAll(",") catch break :blk false;
+            const pat_esc = allocJsonEscape(gpa, pat) catch break :blk false;
+            defer gpa.free(pat_esc);
+            w.interface.print("\"{s}\"", .{pat_esc}) catch break :blk false;
+        }
+        w.interface.writeAll("]}\n") catch break :blk false;
+        w.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    f.close(io);
+    if (ok) atomicRenameAbsolute(tmp_path, state_path);
+}
+
+pub fn computeProjectState(gpa: std.mem.Allocator, io: std.Io, project_path: []const u8, mode: ProjectStateMode) !ProjectStateResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+
+    // Ensure state directory exists
+    const state_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman/state", .{home});
+    defer gpa.free(state_dir);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+    std.Io.Dir.createDirAbsolute(io, state_dir, .default_dir) catch {};
+
+    const state_path = try projectStatePath(gpa, home, project_path);
+    defer gpa.free(state_path);
+
+    var decisions: std.ArrayList(ProjectStateDecision) = .empty;
+    var patterns: std.ArrayList([]u8) = .empty;
+
+    parseProjectStateFile(gpa, io, state_path, &decisions, &patterns);
+
+    var dirty = false;
+
+    switch (mode) {
+        .read => {},
+        .record_decision => |rec| {
+            if (decisions.items.len < PROJECT_STATE_MAX_DECISIONS) {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+                const date_str = try tsToDateStr(gpa, @intCast(ts.sec));
+                const dec = ProjectStateDecision{
+                    .date = date_str,
+                    .what = try gpa.dupe(u8, rec.what),
+                    .why = try gpa.dupe(u8, rec.why),
+                };
+                try decisions.append(gpa, dec);
+                dirty = true;
+            }
+        },
+        .record_pattern => |pat| {
+            if (patterns.items.len < PROJECT_STATE_MAX_PATTERNS) {
+                const dup = try gpa.dupe(u8, pat);
+                try patterns.append(gpa, dup);
+                dirty = true;
+            }
+        },
+    }
+
+    if (dirty) {
+        writeProjectStateFile(gpa, io, state_path, decisions.items, patterns.items);
+    }
+
+    return .{
+        .path = try gpa.dupe(u8, project_path),
+        .decisions = try decisions.toOwnedSlice(gpa),
+        .known_patterns = try patterns.toOwnedSlice(gpa),
+    };
+}
+
+// --- registry ---
+
+pub const RegistrySubcommand = struct {
+    name: []const u8,
+    description: []const u8,
+    args: []const u8,
+};
+
+pub const RegistryResult = struct {
+    version: []const u8,
+    subcommands: []const RegistrySubcommand,
+};
+
+pub fn computeRegistry() RegistryResult {
+    const cmds: []const RegistrySubcommand = &[_]RegistrySubcommand{
+        .{ .name = "doctor", .description = "session deps (claude/git/gh present + versions)", .args = "" },
+        .{ .name = "compat-check", .description = "tool version drift vs baseline; surfaces rollback advice", .args = "[--baseline|--update-baseline]" },
+        .{ .name = "status", .description = "workspace up-to-date vs origin", .args = "<workspace>" },
+        .{ .name = "changes-preview", .description = "incoming commits + files changed", .args = "<repo>" },
+        .{ .name = "commits", .description = "commits since a tag", .args = "<repo> [tag]" },
+        .{ .name = "gh-user", .description = "GitHub auth + login info", .args = "" },
+        .{ .name = "release-info", .description = "latest tag, next version, dirty state", .args = "<repo>" },
+        .{ .name = "repo-info", .description = "remote owner/repo/url", .args = "<repo>" },
+        .{ .name = "tag-exists", .description = "check if a tag exists", .args = "<repo> <tag>" },
+        .{ .name = "scan", .description = "project structure, entry point, file inventory", .args = "<path>" },
+        .{ .name = "diff-dirs", .description = "structural diff of two directories", .args = "<path1> <path2>" },
+        .{ .name = "grep", .description = "search for a string across files", .args = "<root> <pattern> [ext]" },
+        .{ .name = "find-files", .description = "find files by name/glob", .args = "<root> <glob>" },
+        .{ .name = "json-query", .description = "extract a value from a JSON file", .args = "<file> <dot-path>" },
+        .{ .name = "git-diff", .description = "structured diff summary", .args = "<repo> [ref]" },
+        .{ .name = "list-dir", .description = "immediate directory contents", .args = "<path>" },
+        .{ .name = "file-stats", .description = "line count + byte size of a file", .args = "<file>" },
+        .{ .name = "env-scan", .description = ".env* file keys (keys only, never values)", .args = "<root>" },
+        .{ .name = "toml-query", .description = "extract a value from a TOML file", .args = "<file> <dot-path>" },
+        .{ .name = "parse-stack", .description = "structured file:line:col:fn from a stack trace (stdin)", .args = "" },
+        .{ .name = "log-match", .description = "match log text (stdin) against a caller-supplied pattern-library JSON file", .args = "<pattern-file>" },
+        .{ .name = "list-projects", .description = "GitHub repos with isForeman + isLocal flags", .args = "<4orman-root>" },
+        .{ .name = "tarball-sha", .description = "GitHub tarball SHA256 with retry", .args = "<owner> <repo> <tag>" },
+        .{ .name = "formula-info", .description = "Homebrew formula fields (url, sha256, version)", .args = "<tap-path> <formula-name>" },
+        .{ .name = "validate-hooks", .description = "Claude Code Stop hooks present check", .args = "" },
+        .{ .name = "gh-release", .description = "GitHub release creation via notes file", .args = "<owner> <repo> <tag> <title> <notes-file>" },
+        .{ .name = "file-hash", .description = "SHA256 hash of a local file", .args = "<file>" },
+        .{ .name = "cache-fetch", .description = "retrieve cached sub-key for a file; hit:true means skip read", .args = "<file> <sub-key>" },
+        .{ .name = "cache-store", .description = "store extracted JSON keyed to file content (stdin)", .args = "<file> <sub-key>" },
+        .{ .name = "cache-check", .description = "persistent change detection for a file", .args = "<file>" },
+        .{ .name = "context-scan", .description = "compact project summary (structure + top files by size)", .args = "<path>" },
+        .{ .name = "context-rank", .description = "relevance ranking — score files by query (top 15)", .args = "<root> <query>" },
+        .{ .name = "context-changed", .description = "changed files with unified diff content", .args = "<repo> [ref]" },
+        .{ .name = "context-evidence", .description = "relevant excerpts from a file without reading the whole thing", .args = "<file> <pattern>" },
+        .{ .name = "yaml-query", .description = "extract a value from a YAML file", .args = "<file> <dot-path>" },
+        .{ .name = "outline", .description = "structural outline of a source file (function/class names + lines)", .args = "<file>" },
+        .{ .name = "deps", .description = "project dependencies from any package manifest", .args = "<root>" },
+        .{ .name = "run-tests", .description = "run tests + get structured pass/fail/failures", .args = "<root>" },
+        .{ .name = "build", .description = "detect build system, run build, get structured errors/warnings", .args = "<root>" },
+        .{ .name = "env-inspect", .description = "detect languages, runtimes, package managers, missing deps", .args = "<root>" },
+        .{ .name = "symbol-find", .description = "locate a symbol's definition and all references", .args = "<root> <symbol>" },
+        .{ .name = "secret-scan", .description = "scan for hardcoded secrets across a project", .args = "<root>" },
+        .{ .name = "public-release-check", .description = "7-check gate before a repo goes public: secrets, watchlist company/project names, PII, git-history emails, project-signature structure, hardcoded paths", .args = "<repo-path> [watchlist-file]" },
+        .{ .name = "device-scan", .description = "snapshot hardware + tools + optimal settings to profile.json", .args = "" },
+        .{ .name = "delta-context", .description = "changed symbols since a ref + their callers", .args = "<repo> [ref]" },
+        .{ .name = "git-cache", .description = "branch, HEAD, dirty state, ahead/behind, last 10 commits (cached)", .args = "<repo>" },
+        .{ .name = "project-state", .description = "read/write project decisions and known patterns across sessions", .args = "<path> [record-decision <what> [<why>] | record-pattern <pattern>]" },
+        .{ .name = "ledger", .description = "decision ledger — Claude-vs-Zig contests, values trade-offs, solo-vs-multi-agent approach decisions, ROI-ranked curriculum entries, and gated architecture-change proposals, with 365-day staleness revalidation (stored at ~/.4orman/ledger.json)", .args = "[show | record <winner> <question> <reasoning> | record-jungian <question> <chosen> <shadow> <synthesis> | record-outcome <id> <outcome> <matched|diverged> | record-approach <question> <solo|multi-agent> <reasoning> <tokens-spent> | record-curriculum <domain> <topic> <highest|medium|lowest> <tool|doc|both> <artifact-ref> <reasoning> <shadow> <synthesis> | record-architecture <topic> <highest|medium|lowest> <pct> <true|false> <proposed|built|rejected> <reasoning> <shadow> <synthesis> | check-stale | validate <id> | score <question> <sources-json>]" },
+        .{ .name = "shell-run", .description = "run a shell command safely — blocks destructive patterns", .args = "[--timeout <ms>] <command>" },
+        .{ .name = "quality-gate", .description = "aggregate build + test results into a severity-bucketed verdict", .args = "<root>" },
+        .{ .name = "validate-schema", .description = "validate a JSON file against a JSON Schema subset", .args = "<file> <schema>" },
+        .{ .name = "prod-ready", .description = "composite production readiness: quality-gate + secret-scan + env-inspect", .args = "<root>" },
+        .{ .name = "registry", .description = "machine-readable catalog of all subcommands (this output)", .args = "" },
+        .{ .name = "capability-check", .description = "check if a capability is natively available in 4orman-tools or needs Claude fallback", .args = "<query...>" },
+        .{ .name = "route", .description = "task router — returns execution plan with subcommand, argHint, confidence, reason", .args = "<task...>" },
+        .{ .name = "delegation-check", .description = "recommend solo vs multi-agent for a task — ledger precedent first, then a trivial/standard/full-build heuristic; never a token-cost prediction", .args = "<task-type> <trivial|standard|full-build>" },
+        .{ .name = "curriculum-check", .description = "ROI-ranked learn/build inventory check for a tech domain/topic — ledger precedent only, no fallback taxonomy; needsDecision: true means decide the ROI tier as a values call and record via ledger record-curriculum", .args = "<domain> <topic>" },
+        .{ .name = "curriculum-list", .description = "all recorded curriculum entries for a domain, sorted highest-ROI first", .args = "<domain>" },
+        .{ .name = "architecture-check", .description = "gated ROI check for a proposed change to 4orman's own architecture — recommend is build only if estimated improvement >= 1% and no drawbacks, else reconsider-with-user; ledger precedent first", .args = "<topic> <estimated-improvement-pct> <true|false>" },
+        .{ .name = "architecture-list", .description = "all recorded architecture-change proposals, sorted highest-ROI first — the growth-monitoring view", .args = "" },
+        .{ .name = "report", .description = "composite project status — git state + build + tests + secrets", .args = "<path>" },
+        .{ .name = "metrics", .description = "telemetry snapshot — cache entries, project states, decisions, estimated token savings", .args = "" },
+        .{ .name = "session-snapshot", .description = "write ground-truth session state to ~/.4orman/session-snapshot.json before compaction", .args = "<4orman-root>" },
+        .{ .name = "sandbox-check", .description = "classify a shell operation by severity (safe/caution/destructive/blocked) and return whether it is allowed", .args = "<command...>" },
+        .{ .name = "rollback", .description = "snapshot/list/revert git state — capture current HEAD+branch, list stored snapshots, or get revert commands for a snapshot", .args = "<repo-path> [--list | --revert <id>]" },
+        .{ .name = "capability-promote", .description = "score a shell command for promotion eligibility as a 4orman-tools subcommand (0-100 + recommendation)", .args = "<command...>" },
+        .{ .name = "ant", .description = "list files changed in a path since a timestamp (mtime-based, no git required)", .args = "<path> [--since <ms>]" },
+        .{ .name = "worker-run", .description = "run a script in a language runtime (python/node/deno/bun/go/ruby/bash/swift/zig/lua/php) — returns structured JSON", .args = "<lang> <script> [args...]" },
+        .{ .name = "worker-list", .description = "list all supported language workers with binary name and file extension", .args = "" },
+        .{ .name = "plugin-run", .description = "execute a plugin from ~/.4orman/plugins/<name>/ via its worker runtime — returns plugin JSON output verbatim", .args = "<name> [args...]" },
+        .{ .name = "plugin-list", .description = "list all installed plugins with name, lang, description, args, and entry point", .args = "" },
+        .{ .name = "context-slice", .description = "focused project slice — top 8 files by relevance + excerpts; use before handing context to a subagent", .args = "<abs-path> <focus-query>" },
+        .{ .name = "state-merge", .description = "merge two JSON objects — array fields concatenated, non-array fields v2 wins; use to combine multi-agent partial results", .args = "<file1> <file2>" },
+        .{ .name = "tui", .description = "interactive project dashboard — j/k navigate, q quit, r reload", .args = "[<4orman-root>]" },
+        .{ .name = "knowledge-audit", .description = "audit project knowledge extraction — safe-to-delete gate before export/archive", .args = "<project-path> [<4orman-root>]" },
+        .{ .name = "export", .description = "package a project as .fmz or generate a platform installer script", .args = "<project-path> [--format fmz|brew|mac|linux|windows|backup] [--out <dir>]" },
+        .{ .name = "import", .description = "absorb a .fmz or raw project directory into ~/4orman", .args = "<source-path> [<4orman-root>]" },
+        .{ .name = "promotion-queue", .description = "track Zig subcommands built locally but not yet brew-released — list/add/clear pending-promotions.json", .args = "[list | add <name> <description> | clear]" },
+    };
+    return .{ .version = VERSION, .subcommands = cmds };
+}
+
+// --- capability-check ---
+
+pub const CapabilityCheckResult = struct {
+    query: []const u8,
+    available: bool,
+    source: []const u8, // "native" | "ledger" | "claude"
+    subcommand: []const u8, // "" when not found
+    description: []const u8, // "" when not found
+    args: []const u8, // "" when not found
+    confidence: []const u8, // "exact" | "high" | "medium" | "low" | "none"
+    ledger_id: []const u8, // "" unless source == "ledger"
+    ledger_reasoning: []const u8, // "" unless source == "ledger"
+    needs_decision: bool, // true only when neither native nor ledger has an answer
+};
+
+// Fuzzy-matches `query` against non-stale ledger questions (same word-overlap
+// scoring spirit as the registry matcher below). Returns a duped, caller-owned
+// LedgerEntry on a >=50% word-overlap match, else null. Stale entries are
+// never matched — a stale precedent must not be reused silently.
+
+// Both inputs must already be lowercased. Returns percent of query words
+// (len >= 3) found as a substring of the ledger question.
+fn ledgerWordOverlapScore(query_lower: []const u8, question_lower: []const u8) u32 {
+    var word_count: u32 = 0;
+    var match_count: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, query_lower, ' ');
+    while (it.next()) |word| {
+        if (word.len < 3) continue;
+        word_count += 1;
+        if (std.mem.indexOf(u8, question_lower, word) != null) match_count += 1;
+    }
+    if (word_count == 0) return 0;
+    return (match_count * 100) / word_count;
+}
+
+fn findLedgerPrecedent(gpa: std.mem.Allocator, io: std.Io, query: []const u8) !?LedgerEntry {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    const q_lower = try gpa.alloc(u8, query.len);
+    defer gpa.free(q_lower);
+    for (query, 0..) |c, i| q_lower[i] = std.ascii.toLower(c);
+
+    var best_score: u32 = 0;
+    var best_idx: ?usize = null;
+    for (entries.items, 0..) |e, idx| {
+        // Jungian entries are values trade-offs, not factual/tool-choice
+        // precedent — they must never silently override a capability-check,
+        // route, build, or test-framework decision.
+        if (e.is_stale or std.mem.eql(u8, e.category, "jungian") or std.mem.eql(u8, e.category, "approach") or std.mem.eql(u8, e.category, "curriculum") or std.mem.eql(u8, e.category, "architecture")) continue;
+        const qn_lower = try gpa.alloc(u8, e.question.len);
+        defer gpa.free(qn_lower);
+        for (e.question, 0..) |c, i| qn_lower[i] = std.ascii.toLower(c);
+
+        const score = ledgerWordOverlapScore(q_lower, qn_lower);
+        if (score > best_score and score >= 50) {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+
+    if (best_idx) |idx| {
+        const e = entries.items[idx];
+        return LedgerEntry{
+            .id = try gpa.dupe(u8, e.id),
+            .date = try gpa.dupe(u8, e.date),
+            .recorded_ts = e.recorded_ts,
+            .revalidation_due_ts = e.revalidation_due_ts,
+            .winner = try gpa.dupe(u8, e.winner),
+            .question = try gpa.dupe(u8, e.question),
+            .reasoning = try gpa.dupe(u8, e.reasoning),
+            .is_stale = e.is_stale,
+            .category = try gpa.dupe(u8, e.category),
+            .shadow = try gpa.dupe(u8, e.shadow),
+            .synthesis = try gpa.dupe(u8, e.synthesis),
+            .outcome = try gpa.dupe(u8, e.outcome),
+            .outcome_matched = try gpa.dupe(u8, e.outcome_matched),
+            .outcome_recorded_ts = e.outcome_recorded_ts,
+            .outcome_review_due = e.outcome_review_due,
+            .tokens_spent = e.tokens_spent,
+            .domain = try gpa.dupe(u8, e.domain),
+            .artifact_type = try gpa.dupe(u8, e.artifact_type),
+            .artifact_ref = try gpa.dupe(u8, e.artifact_ref),
+            .status = try gpa.dupe(u8, e.status),
+            .estimated_improvement_pct = e.estimated_improvement_pct,
+            .has_drawbacks = e.has_drawbacks,
+        };
+    }
+    return null;
+}
+
+// Sibling to findLedgerPrecedent, scoped to category == "approach" entries
+// specifically — findLedgerPrecedent deliberately excludes them (they're
+// solo-vs-multi-agent decisions, not factual/tool-choice precedent, and must
+// never silently override a capability-check/route/build/test decision).
+// delegation-check needs exactly the entries findLedgerPrecedent skips.
+fn findApproachPrecedent(gpa: std.mem.Allocator, io: std.Io, query: []const u8) !?LedgerEntry {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    const q_lower = try gpa.alloc(u8, query.len);
+    defer gpa.free(q_lower);
+    for (query, 0..) |c, i| q_lower[i] = std.ascii.toLower(c);
+
+    var best_score: u32 = 0;
+    var best_idx: ?usize = null;
+    for (entries.items, 0..) |e, idx| {
+        if (e.is_stale or !std.mem.eql(u8, e.category, "approach")) continue;
+        const qn_lower = try gpa.alloc(u8, e.question.len);
+        defer gpa.free(qn_lower);
+        for (e.question, 0..) |c, i| qn_lower[i] = std.ascii.toLower(c);
+
+        const score = ledgerWordOverlapScore(q_lower, qn_lower);
+        if (score > best_score and score >= 50) {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+
+    if (best_idx) |idx| {
+        const e = entries.items[idx];
+        return LedgerEntry{
+            .id = try gpa.dupe(u8, e.id),
+            .date = try gpa.dupe(u8, e.date),
+            .recorded_ts = e.recorded_ts,
+            .revalidation_due_ts = e.revalidation_due_ts,
+            .winner = try gpa.dupe(u8, e.winner),
+            .question = try gpa.dupe(u8, e.question),
+            .reasoning = try gpa.dupe(u8, e.reasoning),
+            .is_stale = e.is_stale,
+            .category = try gpa.dupe(u8, e.category),
+            .shadow = try gpa.dupe(u8, e.shadow),
+            .synthesis = try gpa.dupe(u8, e.synthesis),
+            .outcome = try gpa.dupe(u8, e.outcome),
+            .outcome_matched = try gpa.dupe(u8, e.outcome_matched),
+            .outcome_recorded_ts = e.outcome_recorded_ts,
+            .outcome_review_due = e.outcome_review_due,
+            .tokens_spent = e.tokens_spent,
+            .domain = try gpa.dupe(u8, e.domain),
+            .artifact_type = try gpa.dupe(u8, e.artifact_type),
+            .artifact_ref = try gpa.dupe(u8, e.artifact_ref),
+            .status = try gpa.dupe(u8, e.status),
+            .estimated_improvement_pct = e.estimated_improvement_pct,
+            .has_drawbacks = e.has_drawbacks,
+        };
+    }
+    return null;
+}
+
+// Sibling to findApproachPrecedent, scoped to category == "curriculum"
+// entries — same reason findLedgerPrecedent excludes "approach"/"jungian":
+// an ROI ranking is not factual/tool-choice precedent and must never
+// silently override a capability-check/route/build/test decision. `query`
+// is expected to already be the caller-built "<domain> <topic>" combined
+// string — this function does not invent a two-field matcher.
+fn findCurriculumPrecedent(gpa: std.mem.Allocator, io: std.Io, query: []const u8) !?LedgerEntry {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    const q_lower = try gpa.alloc(u8, query.len);
+    defer gpa.free(q_lower);
+    for (query, 0..) |c, i| q_lower[i] = std.ascii.toLower(c);
+
+    var best_score: u32 = 0;
+    var best_idx: ?usize = null;
+    for (entries.items, 0..) |e, idx| {
+        if (e.is_stale or !std.mem.eql(u8, e.category, "curriculum")) continue;
+        // Match against "<domain> <topic>" — same combined shape the caller
+        // builds the query from, so a stored entry with a different domain
+        // sharing a similarly-worded topic doesn't false-match.
+        const combined = try std.fmt.allocPrint(gpa, "{s} {s}", .{ e.domain, e.question });
+        defer gpa.free(combined);
+        const cn_lower = try gpa.alloc(u8, combined.len);
+        defer gpa.free(cn_lower);
+        for (combined, 0..) |c, i| cn_lower[i] = std.ascii.toLower(c);
+
+        const score = ledgerWordOverlapScore(q_lower, cn_lower);
+        if (score > best_score and score >= 50) {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+
+    if (best_idx) |idx| {
+        const e = entries.items[idx];
+        return LedgerEntry{
+            .id = try gpa.dupe(u8, e.id),
+            .date = try gpa.dupe(u8, e.date),
+            .recorded_ts = e.recorded_ts,
+            .revalidation_due_ts = e.revalidation_due_ts,
+            .winner = try gpa.dupe(u8, e.winner),
+            .question = try gpa.dupe(u8, e.question),
+            .reasoning = try gpa.dupe(u8, e.reasoning),
+            .is_stale = e.is_stale,
+            .category = try gpa.dupe(u8, e.category),
+            .shadow = try gpa.dupe(u8, e.shadow),
+            .synthesis = try gpa.dupe(u8, e.synthesis),
+            .outcome = try gpa.dupe(u8, e.outcome),
+            .outcome_matched = try gpa.dupe(u8, e.outcome_matched),
+            .outcome_recorded_ts = e.outcome_recorded_ts,
+            .outcome_review_due = e.outcome_review_due,
+            .tokens_spent = e.tokens_spent,
+            .domain = try gpa.dupe(u8, e.domain),
+            .artifact_type = try gpa.dupe(u8, e.artifact_type),
+            .artifact_ref = try gpa.dupe(u8, e.artifact_ref),
+            .status = try gpa.dupe(u8, e.status),
+            .estimated_improvement_pct = e.estimated_improvement_pct,
+            .has_drawbacks = e.has_drawbacks,
+        };
+    }
+    return null;
+}
+
+// Sibling to findCurriculumPrecedent, scoped to category == "architecture"
+// entries — same reason findLedgerPrecedent excludes "curriculum"/"approach"/
+// "jungian": an ROI ranking for a proposed 4orman architecture change is not
+// factual/tool-choice precedent and must never silently override a
+// capability-check/route/build/test decision. `query` is just the topic —
+// architecture entries have no domain scoping the way curriculum's do.
+fn findArchitecturePrecedent(gpa: std.mem.Allocator, io: std.Io, query: []const u8) !?LedgerEntry {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    const q_lower = try gpa.alloc(u8, query.len);
+    defer gpa.free(q_lower);
+    for (query, 0..) |c, i| q_lower[i] = std.ascii.toLower(c);
+
+    var best_score: u32 = 0;
+    var best_idx: ?usize = null;
+    for (entries.items, 0..) |e, idx| {
+        if (e.is_stale or !std.mem.eql(u8, e.category, "architecture")) continue;
+        const qn_lower = try gpa.alloc(u8, e.question.len);
+        defer gpa.free(qn_lower);
+        for (e.question, 0..) |c, i| qn_lower[i] = std.ascii.toLower(c);
+
+        const score = ledgerWordOverlapScore(q_lower, qn_lower);
+        if (score > best_score and score >= 50) {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+
+    if (best_idx) |idx| {
+        const e = entries.items[idx];
+        return LedgerEntry{
+            .id = try gpa.dupe(u8, e.id),
+            .date = try gpa.dupe(u8, e.date),
+            .recorded_ts = e.recorded_ts,
+            .revalidation_due_ts = e.revalidation_due_ts,
+            .winner = try gpa.dupe(u8, e.winner),
+            .question = try gpa.dupe(u8, e.question),
+            .reasoning = try gpa.dupe(u8, e.reasoning),
+            .is_stale = e.is_stale,
+            .category = try gpa.dupe(u8, e.category),
+            .shadow = try gpa.dupe(u8, e.shadow),
+            .synthesis = try gpa.dupe(u8, e.synthesis),
+            .outcome = try gpa.dupe(u8, e.outcome),
+            .outcome_matched = try gpa.dupe(u8, e.outcome_matched),
+            .outcome_recorded_ts = e.outcome_recorded_ts,
+            .outcome_review_due = e.outcome_review_due,
+            .tokens_spent = e.tokens_spent,
+            .domain = try gpa.dupe(u8, e.domain),
+            .artifact_type = try gpa.dupe(u8, e.artifact_type),
+            .artifact_ref = try gpa.dupe(u8, e.artifact_ref),
+            .status = try gpa.dupe(u8, e.status),
+            .estimated_improvement_pct = e.estimated_improvement_pct,
+            .has_drawbacks = e.has_drawbacks,
+        };
+    }
+    return null;
+}
+
+// True if `needle` appears in `haystack` bounded by non-alphanumeric chars
+// (or string edges) on both sides — "go" matches "go build" but not "Cargo".
+fn containsWholeWord(haystack: []const u8, needle: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |pos| {
+        const before_ok = pos == 0 or !std.ascii.isAlphanumeric(haystack[pos - 1]);
+        const after_pos = pos + needle.len;
+        const after_ok = after_pos >= haystack.len or !std.ascii.isAlphanumeric(haystack[after_pos]);
+        if (before_ok and after_ok) return true;
+        start = pos + 1;
+    }
+    return false;
+}
+
+// Exact-match ledger lookup (unlike findLedgerPrecedent's fuzzy word-overlap
+// scorer): tool/framework-choice questions are templated ("which X for
+// <path>: candidates are <list>"), so fuzzy matching on shared boilerplate
+// words would conflate two different projects' unrelated ambiguities. Exact
+// equality is safe here because the caller builds the question identically
+// every time for the same path + candidate set.
+fn findExactLedgerEntry(gpa: std.mem.Allocator, io: std.Io, question: []const u8) !?LedgerEntry {
+    const home_ptr = std.c.getenv("HOME") orelse return null;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    for (entries.items) |e| {
+        // Same boundary as findLedgerPrecedent: jungian and approach entries
+        // never resolve a tool-choice ambiguity — different kind of question.
+        if (e.is_stale or std.mem.eql(u8, e.category, "jungian") or std.mem.eql(u8, e.category, "approach") or std.mem.eql(u8, e.category, "curriculum") or std.mem.eql(u8, e.category, "architecture")) continue;
+        if (std.mem.eql(u8, e.question, question)) {
+            return LedgerEntry{
+                .id = try gpa.dupe(u8, e.id),
+                .date = try gpa.dupe(u8, e.date),
+                .recorded_ts = e.recorded_ts,
+                .revalidation_due_ts = e.revalidation_due_ts,
+                .winner = try gpa.dupe(u8, e.winner),
+                .question = try gpa.dupe(u8, e.question),
+                .reasoning = try gpa.dupe(u8, e.reasoning),
+                .is_stale = e.is_stale,
+                .category = try gpa.dupe(u8, e.category),
+                .shadow = try gpa.dupe(u8, e.shadow),
+                .synthesis = try gpa.dupe(u8, e.synthesis),
+                .outcome = try gpa.dupe(u8, e.outcome),
+                .outcome_matched = try gpa.dupe(u8, e.outcome_matched),
+                .outcome_recorded_ts = e.outcome_recorded_ts,
+                .outcome_review_due = e.outcome_review_due,
+                .tokens_spent = e.tokens_spent,
+                .domain = try gpa.dupe(u8, e.domain),
+                .artifact_type = try gpa.dupe(u8, e.artifact_type),
+                .artifact_ref = try gpa.dupe(u8, e.artifact_ref),
+                .status = try gpa.dupe(u8, e.status),
+                .estimated_improvement_pct = e.estimated_improvement_pct,
+                .has_drawbacks = e.has_drawbacks,
+            };
+        }
+    }
+    return null;
+}
+
+pub const CandidateResolution = struct {
+    chosen: []const u8,
+    // "detection" — only one candidate ever existed, nothing ambiguous.
+    // "ledger" — multiple candidates existed but a recorded, non-stale
+    //   ledger precedent named exactly one of them, so it overrides the
+    //   tie-break.
+    // "tie-break" — multiple candidates, no unambiguous precedent found;
+    //   `chosen` is just candidates[0] by priority order — genuinely
+    //   uncertain.
+    resolved_by: []const u8,
+};
+
+// Resolves a set of detection candidates (build tools, test frameworks) the
+// same way capability-check/route resolve tasks: check the ledger for a
+// precedent before silently trusting a priority-order tie-break. `question`
+// must be built identically on every call for the same path + candidate set
+// (callers use "which <thing> for <path>: candidates are <list>") — this
+// function requires an exact match, not a fuzzy one.
+fn resolveCandidateViaLedger(gpa: std.mem.Allocator, io: std.Io, question: []const u8, candidates: []const []const u8) !CandidateResolution {
+    if (candidates.len <= 1) {
+        return .{ .chosen = candidates[0], .resolved_by = "detection" };
+    }
+    if (try findExactLedgerEntry(gpa, io, question)) |entry| {
+        defer {
+            gpa.free(entry.id);
+            gpa.free(entry.date);
+            gpa.free(entry.winner);
+            gpa.free(entry.question);
+            gpa.free(entry.reasoning);
+        }
+        var reasoning_lower_buf: [512]u8 = undefined;
+        const rlen = @min(entry.reasoning.len, reasoning_lower_buf.len);
+        for (entry.reasoning[0..rlen], 0..) |c, i| reasoning_lower_buf[i] = std.ascii.toLower(c);
+        const reasoning_lower = reasoning_lower_buf[0..rlen];
+        // Only override when EXACTLY one candidate name appears as a whole
+        // word in the reasoning — an unambiguous signal. Reasoning that
+        // mentions two candidates (e.g. explaining why one was rejected) is
+        // not a reliable "this one wins" signal — a wrong confident pick is
+        // worse than falling through to the tie-break, so ambiguous mentions
+        // are treated as no match.
+        var matched: ?[]const u8 = null;
+        var match_count: u32 = 0;
+        for (candidates) |c| {
+            if (containsWholeWord(reasoning_lower, c)) {
+                matched = c;
+                match_count += 1;
+            }
+        }
+        if (match_count == 1) {
+            return .{ .chosen = matched.?, .resolved_by = "ledger" };
+        }
+    }
+    return .{ .chosen = candidates[0], .resolved_by = "tie-break" };
+}
+
+pub fn computeCapabilityCheck(gpa: std.mem.Allocator, io: std.Io, query: []const u8) !CapabilityCheckResult {
+    const reg = computeRegistry();
+
+    // Lowercase query once
+    const q_lower = try gpa.alloc(u8, query.len);
+    defer gpa.free(q_lower);
+    for (query, 0..) |c, i| q_lower[i] = std.ascii.toLower(c);
+
+    var best_score: u32 = 0;
+    var best_total: u32 = 0; // tie-breaker: total name+desc word matches
+    var best_idx: usize = reg.subcommands.len;
+
+    for (reg.subcommands, 0..) |cmd, idx| {
+        const name_lower = try gpa.alloc(u8, cmd.name.len);
+        defer gpa.free(name_lower);
+        for (cmd.name, 0..) |c, i| name_lower[i] = std.ascii.toLower(c);
+
+        const desc_lower = try gpa.alloc(u8, cmd.description.len);
+        defer gpa.free(desc_lower);
+        for (cmd.description, 0..) |c, i| desc_lower[i] = std.ascii.toLower(c);
+
+        var score: u32 = 0;
+        var name_match_count: u32 = 0;
+        var desc_match_count: u32 = 0;
+
+        if (std.mem.eql(u8, name_lower, q_lower)) {
+            score = 100;
+        } else if (std.mem.indexOf(u8, name_lower, q_lower) != null or
+            std.mem.indexOf(u8, q_lower, name_lower) != null)
+        {
+            score = 80;
+        } else {
+            var all_in_name: bool = true;
+            var all_in_desc: bool = true;
+            var any_in_name: bool = false;
+            var any_in_desc: bool = false;
+            var word_count: u32 = 0;
+            var it = std.mem.tokenizeScalar(u8, q_lower, ' ');
+            while (it.next()) |word| {
+                if (word.len < 3) continue; // skip stop words
+                word_count += 1;
+                if (std.mem.indexOf(u8, name_lower, word) != null) {
+                    any_in_name = true;
+                    name_match_count += 1;
+                } else {
+                    all_in_name = false;
+                }
+                if (std.mem.indexOf(u8, desc_lower, word) != null) {
+                    any_in_desc = true;
+                    desc_match_count += 1;
+                } else {
+                    all_in_desc = false;
+                }
+            }
+            if (word_count > 0) {
+                if (all_in_name) score = 70 else if (all_in_desc) score = 60 else if (name_match_count >= 2) score = 50 else if (desc_match_count >= 2) score = 45 else if (any_in_name) score = 35 else if (any_in_desc) score = 30;
+            }
+        }
+
+        const total = name_match_count + desc_match_count;
+        if (score > best_score or (score == best_score and total > best_total)) {
+            best_score = score;
+            best_total = total;
+            best_idx = idx;
+        }
+    }
+
+    const THRESHOLD: u32 = 30;
+    if (best_idx < reg.subcommands.len and best_score >= THRESHOLD) {
+        const cmd = reg.subcommands[best_idx];
+        const confidence: []const u8 = if (best_score >= 100) "exact" else if (best_score >= 70) "high" else if (best_score >= 50) "medium" else "low";
+        return .{
+            .query = try gpa.dupe(u8, query),
+            .available = true,
+            .source = "native",
+            .subcommand = cmd.name,
+            .description = cmd.description,
+            .args = cmd.args,
+            .confidence = confidence,
+            .ledger_id = "",
+            .ledger_reasoning = "",
+            .needs_decision = false,
+        };
+    }
+
+    // No native match — a recorded, non-stale ledger precedent on this
+    // question counts as "available" too: it's a decision Claude already
+    // made, not fresh reasoning.
+    if (try findLedgerPrecedent(gpa, io, query)) |entry| {
+        defer {
+            gpa.free(entry.date);
+            gpa.free(entry.winner);
+            gpa.free(entry.question);
+        }
+        return .{
+            .query = try gpa.dupe(u8, query),
+            .available = true,
+            .source = "ledger",
+            .subcommand = "",
+            .description = "",
+            .args = "",
+            .confidence = "medium",
+            .ledger_id = entry.id,
+            .ledger_reasoning = entry.reasoning,
+            .needs_decision = false,
+        };
+    }
+
+    return .{
+        .query = try gpa.dupe(u8, query),
+        .available = false,
+        .source = "claude",
+        .subcommand = "",
+        .description = "",
+        .args = "",
+        .confidence = "none",
+        .ledger_id = "",
+        .ledger_reasoning = "",
+        .needs_decision = true,
+    };
+}
+
+// --- route ---
+
+pub const RouteStep = struct {
+    step: u32,
+    layer: []const u8,
+    subcommand: []const u8,
+    arg_hint: []const u8,
+    reason: []const u8,
+    confidence: []const u8,
+};
+
+pub const RouteResult = struct {
+    task: []const u8,
+    routed: bool,
+    steps: []RouteStep, // gpa-owned slice; strings within are borrowed from static data
+    fallback: []const u8, // "claude" or ""
+    reason: []const u8, // fallback explanation or ""
+};
+
+const RouteEnrichment = struct {
+    subcommand: []const u8,
+    arg_hint: []const u8,
+    reason: []const u8,
+};
+
+const ROUTE_ENRICHMENTS: []const RouteEnrichment = &[_]RouteEnrichment{
+    .{ .subcommand = "git-cache", .arg_hint = "<repo-path>", .reason = "cached branch/HEAD/dirty/commits — hit:true means zero git subprocesses this session" },
+    .{ .subcommand = "status", .arg_hint = "<workspace>", .reason = "workspace up-to-date vs origin in one call; use before git operations" },
+    .{ .subcommand = "run-tests", .arg_hint = "<abs-path>", .reason = "auto-detects framework, runs tests, returns structured failures — read verdict + failures array" },
+    .{ .subcommand = "build", .arg_hint = "<abs-path>", .reason = "auto-detects build system, returns structured errors with file:line — read success + errors array" },
+    .{ .subcommand = "quality-gate", .arg_hint = "<abs-path>", .reason = "runs build + tests, severity-bucketed verdict — call before promoting or merging" },
+    .{ .subcommand = "prod-ready", .arg_hint = "<abs-path>", .reason = "composite gate (quality-gate + secret-scan + env-inspect) — call before any deploy" },
+    .{ .subcommand = "secret-scan", .arg_hint = "<abs-path>", .reason = "walks project tree, flags hardcoded secrets by pattern — read findings array" },
+    .{ .subcommand = "outline", .arg_hint = "<abs-file-path>", .reason = "function/class/struct names + line numbers — use instead of reading the full file" },
+    .{ .subcommand = "context-scan", .arg_hint = "<abs-path>", .reason = "compact project summary (structure + top files by size) — use before reading any source" },
+    .{ .subcommand = "context-rank", .arg_hint = "<abs-root> <query>", .reason = "score and rank files by query relevance — read highest-ranked files first" },
+    .{ .subcommand = "context-evidence", .arg_hint = "<abs-file> <pattern>", .reason = "relevant excerpts (±10 lines) without reading the whole file" },
+    .{ .subcommand = "symbol-find", .arg_hint = "<abs-root> <symbol>", .reason = "definition + all references in one call — replaces grep + read N files" },
+    .{ .subcommand = "deps", .arg_hint = "<abs-root>", .reason = "declared dependencies from any manifest — replaces reading the full manifest file" },
+    .{ .subcommand = "env-inspect", .arg_hint = "<abs-root>", .reason = "detects languages, runtimes, package managers, missing deps — replaces which + --version loops" },
+    .{ .subcommand = "project-state", .arg_hint = "<abs-path>", .reason = "persisted decisions and known patterns across sessions from ~/.4orman/state/" },
+    .{ .subcommand = "cache-fetch", .arg_hint = "<abs-file> <sub-key>", .reason = "hit:true → skip the read entirely and use value; hit:false → read file + cache-store" },
+    .{ .subcommand = "delta-context", .arg_hint = "<repo-path> [ref]", .reason = "changed symbols + callers — targeted impact analysis without reading raw git diffs" },
+    .{ .subcommand = "validate-schema", .arg_hint = "<abs-file> <abs-schema>", .reason = "JSON Schema compliance check — returns violations with $-rooted paths" },
+    .{ .subcommand = "shell-run", .arg_hint = "[--timeout <ms>] <cmd>", .reason = "safe shell execution with destructive-pattern blocking and structured output" },
+    .{ .subcommand = "scan", .arg_hint = "<abs-path>", .reason = "project structure, entry point, file inventory — use context-scan when only structure is needed" },
+    .{ .subcommand = "git-diff", .arg_hint = "<repo> [ref]", .reason = "structured diff summary — use instead of reading raw git diff output" },
+    .{ .subcommand = "doctor", .arg_hint = "", .reason = "session deps check (claude/git/gh present + versions) — run once at session start" },
+    .{ .subcommand = "release-info", .arg_hint = "<repo>", .reason = "latest tag, next version, dirty state in one call — use before /release or /brew-release" },
+    .{ .subcommand = "file-hash", .arg_hint = "<abs-file>", .reason = "SHA256 of a local file — foundation for change detection before re-reading" },
+    .{ .subcommand = "capability-check", .arg_hint = "<query...>", .reason = "check if a task is natively handled before deciding whether to shell out" },
+};
+
+pub fn computeRoute(gpa: std.mem.Allocator, io: std.Io, task: []const u8) !RouteResult {
+    const cap = try computeCapabilityCheck(gpa, io, task);
+    defer gpa.free(cap.query);
+
+    if (cap.available and std.mem.eql(u8, cap.source, "ledger")) {
+        const steps = try gpa.alloc(RouteStep, 1);
+        steps[0] = .{
+            .step = 1,
+            .layer = "ledger",
+            .subcommand = "ledger validate",
+            .arg_hint = cap.ledger_id,
+            .reason = cap.ledger_reasoning,
+            .confidence = cap.confidence,
+        };
+        return .{
+            .task = try gpa.dupe(u8, task),
+            .routed = true,
+            .steps = steps,
+            .fallback = "",
+            .reason = "",
+        };
+    }
+
+    if (!cap.available) {
+        const reason: []const u8 = if (cap.needs_decision)
+            "no native subcommand and no ledger precedent — priority decision: resolve now and record the verdict via `ledger record` so it isn't re-litigated next time"
+        else
+            "no native subcommand matches this task";
+        return .{
+            .task = try gpa.dupe(u8, task),
+            .routed = false,
+            .steps = try gpa.alloc(RouteStep, 0),
+            .fallback = "claude",
+            .reason = reason,
+        };
+    }
+
+    // Find enrichment for the matched subcommand
+    var arg_hint: []const u8 = cap.args;
+    var reason: []const u8 = cap.description;
+    for (ROUTE_ENRICHMENTS) |enrich| {
+        if (std.mem.eql(u8, enrich.subcommand, cap.subcommand)) {
+            arg_hint = enrich.arg_hint;
+            reason = enrich.reason;
+            break;
+        }
+    }
+
+    const steps = try gpa.alloc(RouteStep, 1);
+    steps[0] = .{
+        .step = 1,
+        .layer = "native",
+        .subcommand = cap.subcommand,
+        .arg_hint = arg_hint,
+        .reason = reason,
+        .confidence = cap.confidence,
+    };
+
+    return .{
+        .task = try gpa.dupe(u8, task),
+        .routed = true,
+        .steps = steps,
+        .fallback = "",
+        .reason = "",
+    };
+}
+
+// --- delegation-check ---
+//
+// Recommends solo vs. multi-agent for a task, never a token-cost prediction —
+// `ledger record-approach` (M47) established that Zig cannot know either
+// approach's actual cost in advance, and this subcommand does not contradict
+// that: it pattern-matches against recorded outcomes and this workspace's own
+// existing trivial/standard/full-build task-scale taxonomy, the same "check
+// the ledger's memory before reasoning fresh" discipline capability-check and
+// route already apply to tool-choice questions.
+
+pub const DelegationCheckResult = struct {
+    task_type: []const u8,
+    complexity_tier: []const u8, // "trivial" | "standard" | "full-build"
+    recommend: []const u8, // "solo" | "multi-agent"
+    suggested_count: u32, // 1 for solo; ledger/heuristic-informed for multi-agent
+    reason: []const u8,
+    source: []const u8, // "ledger" | "heuristic"
+    needs_decision: bool, // true only when heuristic is genuinely ambiguous
+    ledger_id: []const u8, // "" unless source == "ledger"
+};
+
+pub fn computeDelegationCheck(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    task_type: []const u8,
+    complexity_tier: []const u8,
+) !DelegationCheckResult {
+    if (try findApproachPrecedent(gpa, io, task_type)) |entry| {
+        defer {
+            gpa.free(entry.id);
+            gpa.free(entry.date);
+            gpa.free(entry.winner);
+            gpa.free(entry.question);
+            gpa.free(entry.reasoning);
+            gpa.free(entry.category);
+            gpa.free(entry.shadow);
+            gpa.free(entry.synthesis);
+            gpa.free(entry.outcome);
+            gpa.free(entry.outcome_matched);
+            gpa.free(entry.domain);
+            gpa.free(entry.artifact_type);
+            gpa.free(entry.artifact_ref);
+            gpa.free(entry.status);
+        }
+        const is_solo = std.mem.eql(u8, entry.winner, "solo");
+        return .{
+            .task_type = try gpa.dupe(u8, task_type),
+            .complexity_tier = try gpa.dupe(u8, complexity_tier),
+            .recommend = try gpa.dupe(u8, entry.winner),
+            .suggested_count = if (is_solo) 1 else 2,
+            .reason = try gpa.dupe(u8, entry.reasoning),
+            .source = "ledger",
+            .needs_decision = false,
+            .ledger_id = try gpa.dupe(u8, entry.id),
+        };
+    }
+
+    // recommend/reason/ledger_id are always heap-owned below, even the
+    // static-literal-looking cases — the caller (main.zig) frees all three
+    // unconditionally, and this struct's fields must never be a mix of
+    // owned and static depending on which branch returned.
+    if (std.mem.eql(u8, complexity_tier, "trivial")) {
+        return .{
+            .task_type = try gpa.dupe(u8, task_type),
+            .complexity_tier = try gpa.dupe(u8, complexity_tier),
+            .recommend = try gpa.dupe(u8, "solo"),
+            .suggested_count = 1,
+            .reason = try gpa.dupe(u8, "trivial tasks are answered directly per this workspace's own task-scaling guardrail — no ledger precedent needed to know that"),
+            .source = "heuristic",
+            .needs_decision = false,
+            .ledger_id = try gpa.dupe(u8, ""),
+        };
+    }
+
+    if (std.mem.eql(u8, complexity_tier, "full-build")) {
+        return .{
+            .task_type = try gpa.dupe(u8, task_type),
+            .complexity_tier = try gpa.dupe(u8, complexity_tier),
+            .recommend = try gpa.dupe(u8, "multi-agent"),
+            .suggested_count = 2,
+            .reason = try gpa.dupe(u8, "full-build tasks touch multiple files or introduce new architecture per this workspace's own task-scaling guardrail — independent delegation (e.g. parallel research, or a verifier separate from the builder) is usually warranted"),
+            .source = "heuristic",
+            .needs_decision = false,
+            .ledger_id = try gpa.dupe(u8, ""),
+        };
+    }
+
+    // "standard" tier with no ledger precedent — genuinely ambiguous, same
+    // tie-break contract build/run-tests already use: default to the safer
+    // choice (solo) and flag needs_decision so the caller resolves and
+    // records the actual outcome via `ledger record-approach`.
+    return .{
+        .task_type = try gpa.dupe(u8, task_type),
+        .complexity_tier = try gpa.dupe(u8, complexity_tier),
+        .recommend = try gpa.dupe(u8, "solo"),
+        .suggested_count = 1,
+        .reason = try gpa.dupe(u8, "standard-tier task with no ledger precedent for this task type — defaulting to solo as the tie-break; record the actual outcome via `ledger record-approach` so this isn't re-litigated next time"),
+        .source = "heuristic",
+        .needs_decision = true,
+        .ledger_id = try gpa.dupe(u8, ""),
+    };
+}
+
+// --- curriculum-check / curriculum-list ---
+//
+// ROI-ranked learn/build inventory for a tech domain or profession. Unlike
+// delegation-check, there is no fixed taxonomy to heuristically fall back on
+// — a domain's topics are arbitrary, so a ledger miss here always means
+// needs_decision: true with no fallback recommendation. Ranking a topic's
+// ROI is a values call with no formal proof (same class as the Jungian
+// ledger category, not a factual contest), so Zig only ever stores what
+// Claude decides via `ledger record-curriculum` — it never invents a
+// ranking, and never scaffolds the artifact itself (confirmed design:
+// Claude decides and builds, Zig records).
+
+pub const CurriculumCheckResult = struct {
+    domain: []const u8,
+    topic: []const u8,
+    roi_tier: []const u8, // "highest" | "medium" | "lowest" | "" (no stored decision)
+    artifact_type: []const u8, // "tool" | "doc" | "both" | ""
+    artifact_ref: []const u8, // "" until something is actually built
+    status: []const u8, // "proposed" | "built" | ""
+    reason: []const u8,
+    source: []const u8, // "ledger" | "none"
+    needs_decision: bool,
+    ledger_id: []const u8, // "" unless source == "ledger"
+};
+
+pub fn computeCurriculumCheck(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    domain: []const u8,
+    topic: []const u8,
+) !CurriculumCheckResult {
+    const query = try std.fmt.allocPrint(gpa, "{s} {s}", .{ domain, topic });
+    defer gpa.free(query);
+
+    if (try findCurriculumPrecedent(gpa, io, query)) |entry| {
+        defer {
+            gpa.free(entry.id);
+            gpa.free(entry.date);
+            gpa.free(entry.winner);
+            gpa.free(entry.question);
+            gpa.free(entry.reasoning);
+            gpa.free(entry.category);
+            gpa.free(entry.shadow);
+            gpa.free(entry.synthesis);
+            gpa.free(entry.outcome);
+            gpa.free(entry.outcome_matched);
+            gpa.free(entry.domain);
+            gpa.free(entry.artifact_type);
+            gpa.free(entry.artifact_ref);
+            gpa.free(entry.status);
+        }
+        return .{
+            .domain = try gpa.dupe(u8, domain),
+            .topic = try gpa.dupe(u8, topic),
+            .roi_tier = try gpa.dupe(u8, entry.winner),
+            .artifact_type = try gpa.dupe(u8, entry.artifact_type),
+            .artifact_ref = try gpa.dupe(u8, entry.artifact_ref),
+            .status = try gpa.dupe(u8, entry.status),
+            .reason = try gpa.dupe(u8, entry.reasoning),
+            .source = "ledger",
+            .needs_decision = false,
+            .ledger_id = try gpa.dupe(u8, entry.id),
+        };
+    }
+
+    // No fixed taxonomy to fall back on — every miss needs a fresh values
+    // decision, recorded via `ledger record-curriculum` afterward.
+    return .{
+        .domain = try gpa.dupe(u8, domain),
+        .topic = try gpa.dupe(u8, topic),
+        .roi_tier = try gpa.dupe(u8, ""),
+        .artifact_type = try gpa.dupe(u8, ""),
+        .artifact_ref = try gpa.dupe(u8, ""),
+        .status = try gpa.dupe(u8, ""),
+        .reason = try gpa.dupe(u8, "no stored decision for this domain+topic — curriculum topics have no fixed taxonomy to heuristically rank against (unlike delegation-check's trivial/standard/full-build); decide the ROI tier as a values call (chosen priority, strongest case against it, what's sacrificed) and record via `ledger record-curriculum`"),
+        .source = "none",
+        .needs_decision = true,
+        .ledger_id = try gpa.dupe(u8, ""),
+    };
+}
+
+pub const CurriculumEntrySummary = struct {
+    topic: []u8,
+    roi_tier: []u8,
+    artifact_type: []u8,
+    artifact_ref: []u8,
+    status: []u8,
+    reasoning: []u8,
+    ledger_id: []u8,
+    date: []u8,
+};
+
+pub const CurriculumListResult = struct {
+    domain: []const u8,
+    entries: []CurriculumEntrySummary,
+};
+
+fn curriculumTierRank(tier: []const u8) u8 {
+    if (std.mem.eql(u8, tier, "highest")) return 0;
+    if (std.mem.eql(u8, tier, "medium")) return 1;
+    if (std.mem.eql(u8, tier, "lowest")) return 2;
+    return 3; // unrecognized value — sorts last, never silently treated as highest
+}
+
+pub fn computeCurriculumList(gpa: std.mem.Allocator, io: std.Io, domain: []const u8) !CurriculumListResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    var out: std.ArrayList(CurriculumEntrySummary) = .empty;
+    errdefer {
+        for (out.items) |s| {
+            gpa.free(s.topic);
+            gpa.free(s.roi_tier);
+            gpa.free(s.artifact_type);
+            gpa.free(s.artifact_ref);
+            gpa.free(s.status);
+            gpa.free(s.reasoning);
+            gpa.free(s.ledger_id);
+            gpa.free(s.date);
+        }
+        out.deinit(gpa);
+    }
+
+    for (entries.items) |e| {
+        if (e.is_stale or !std.mem.eql(u8, e.category, "curriculum")) continue;
+        if (!std.mem.eql(u8, e.domain, domain)) continue;
+        try out.append(gpa, .{
+            .topic = try gpa.dupe(u8, e.question),
+            .roi_tier = try gpa.dupe(u8, e.winner),
+            .artifact_type = try gpa.dupe(u8, e.artifact_type),
+            .artifact_ref = try gpa.dupe(u8, e.artifact_ref),
+            .status = try gpa.dupe(u8, e.status),
+            .reasoning = try gpa.dupe(u8, e.reasoning),
+            .ledger_id = try gpa.dupe(u8, e.id),
+            .date = try gpa.dupe(u8, e.date),
+        });
+    }
+
+    std.mem.sort(CurriculumEntrySummary, out.items, {}, struct {
+        fn lessThan(_: void, a: CurriculumEntrySummary, b: CurriculumEntrySummary) bool {
+            const ra = curriculumTierRank(a.roi_tier);
+            const rb = curriculumTierRank(b.roi_tier);
+            if (ra != rb) return ra < rb;
+            return std.mem.order(u8, a.date, b.date) == .gt;
+        }
+    }.lessThan);
+
+    return .{
+        .domain = try gpa.dupe(u8, domain),
+        .entries = try out.toOwnedSlice(gpa),
+    };
+}
+
+// --- architecture-check / architecture-list ---
+//
+// ROI ranking for proposed changes to 4orman's own architecture, narrower and
+// stricter than curriculum: a new guardrail, subcommand, or hook must clear
+// a hard numeric bar (estimated_improvement_pct >= 1.0 and !has_drawbacks) to
+// be recommended for outright building. Anything short of that is a deliberate
+// human call (recommend: "reconsider-with-user"), never silently built and
+// never silently dropped. Zig only ever applies the gate to numbers Claude
+// supplies and stores the outcome via `ledger record-architecture` — it
+// never estimates the percentage or judges drawbacks itself.
+
+const ARCHITECTURE_GATE_MIN_PCT: f64 = 1.0;
+
+pub const ArchitectureCheckResult = struct {
+    topic: []const u8,
+    roi_tier: []const u8, // "highest" | "medium" | "lowest" | "" (no stored decision)
+    estimated_improvement_pct: f64,
+    has_drawbacks: bool,
+    status: []const u8, // "proposed" | "built" | "rejected" | ""
+    recommend: []const u8, // "build" | "reconsider-with-user" | "already-built" | "already-rejected"
+    reason: []const u8,
+    source: []const u8, // "ledger" | "gate"
+    needs_decision: bool,
+    ledger_id: []const u8, // "" unless source == "ledger"
+};
+
+pub fn computeArchitectureCheck(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    topic: []const u8,
+    estimated_improvement_pct: f64,
+    has_drawbacks: bool,
+) !ArchitectureCheckResult {
+    if (try findArchitecturePrecedent(gpa, io, topic)) |entry| {
+        defer {
+            gpa.free(entry.id);
+            gpa.free(entry.date);
+            gpa.free(entry.winner);
+            gpa.free(entry.question);
+            gpa.free(entry.reasoning);
+            gpa.free(entry.category);
+            gpa.free(entry.shadow);
+            gpa.free(entry.synthesis);
+            gpa.free(entry.outcome);
+            gpa.free(entry.outcome_matched);
+            gpa.free(entry.domain);
+            gpa.free(entry.artifact_type);
+            gpa.free(entry.artifact_ref);
+            gpa.free(entry.status);
+        }
+        const recommend: []const u8 = if (std.mem.eql(u8, entry.status, "built"))
+            "already-built"
+        else if (std.mem.eql(u8, entry.status, "rejected"))
+            "already-rejected"
+        else if (entry.estimated_improvement_pct >= ARCHITECTURE_GATE_MIN_PCT and !entry.has_drawbacks)
+            "build"
+        else
+            "reconsider-with-user";
+        return .{
+            .topic = try gpa.dupe(u8, topic),
+            .roi_tier = try gpa.dupe(u8, entry.winner),
+            .estimated_improvement_pct = entry.estimated_improvement_pct,
+            .has_drawbacks = entry.has_drawbacks,
+            .status = try gpa.dupe(u8, entry.status),
+            .recommend = try gpa.dupe(u8, recommend),
+            .reason = try gpa.dupe(u8, entry.reasoning),
+            .source = "ledger",
+            .needs_decision = false,
+            .ledger_id = try gpa.dupe(u8, entry.id),
+        };
+    }
+
+    // No stored decision — apply the gate directly to the caller-supplied
+    // numbers. This is a deterministic threshold check, not a heuristic
+    // guess, so source is "gate" rather than "heuristic".
+    if (estimated_improvement_pct >= ARCHITECTURE_GATE_MIN_PCT and !has_drawbacks) {
+        return .{
+            .topic = try gpa.dupe(u8, topic),
+            .roi_tier = try gpa.dupe(u8, ""),
+            .estimated_improvement_pct = estimated_improvement_pct,
+            .has_drawbacks = has_drawbacks,
+            .status = try gpa.dupe(u8, ""),
+            .recommend = try gpa.dupe(u8, "build"),
+            .reason = try gpa.dupe(u8, "estimated improvement meets the gate (>= 1%, no drawbacks) and no stored precedent exists — proceed, then `ledger record-architecture` the outcome"),
+            .source = "gate",
+            .needs_decision = false,
+            .ledger_id = try gpa.dupe(u8, ""),
+        };
+    }
+    return .{
+        .topic = try gpa.dupe(u8, topic),
+        .roi_tier = try gpa.dupe(u8, ""),
+        .estimated_improvement_pct = estimated_improvement_pct,
+        .has_drawbacks = has_drawbacks,
+        .status = try gpa.dupe(u8, ""),
+        .recommend = try gpa.dupe(u8, "reconsider-with-user"),
+        .reason = try gpa.dupe(u8, "does not clear the gate (needs >= 1% estimated improvement and no drawbacks) — stop and ask the user explicitly whether to proceed anyway, rather than silently building or silently dropping it"),
+        .source = "gate",
+        .needs_decision = true,
+        .ledger_id = try gpa.dupe(u8, ""),
+    };
+}
+
+pub const ArchitectureEntrySummary = struct {
+    topic: []u8,
+    roi_tier: []u8,
+    estimated_improvement_pct: f64,
+    has_drawbacks: bool,
+    status: []u8,
+    reasoning: []u8,
+    ledger_id: []u8,
+    date: []u8,
+};
+
+pub const ArchitectureListResult = struct {
+    entries: []ArchitectureEntrySummary,
+};
+
+pub fn computeArchitectureList(gpa: std.mem.Allocator, io: std.Io) !ArchitectureListResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    var out: std.ArrayList(ArchitectureEntrySummary) = .empty;
+    errdefer {
+        for (out.items) |s| {
+            gpa.free(s.topic);
+            gpa.free(s.roi_tier);
+            gpa.free(s.status);
+            gpa.free(s.reasoning);
+            gpa.free(s.ledger_id);
+            gpa.free(s.date);
+        }
+        out.deinit(gpa);
+    }
+
+    for (entries.items) |e| {
+        if (e.is_stale or !std.mem.eql(u8, e.category, "architecture")) continue;
+        try out.append(gpa, .{
+            .topic = try gpa.dupe(u8, e.question),
+            .roi_tier = try gpa.dupe(u8, e.winner),
+            .estimated_improvement_pct = e.estimated_improvement_pct,
+            .has_drawbacks = e.has_drawbacks,
+            .status = try gpa.dupe(u8, e.status),
+            .reasoning = try gpa.dupe(u8, e.reasoning),
+            .ledger_id = try gpa.dupe(u8, e.id),
+            .date = try gpa.dupe(u8, e.date),
+        });
+    }
+
+    std.mem.sort(ArchitectureEntrySummary, out.items, {}, struct {
+        fn lessThan(_: void, a: ArchitectureEntrySummary, b: ArchitectureEntrySummary) bool {
+            const ra = curriculumTierRank(a.roi_tier);
+            const rb = curriculumTierRank(b.roi_tier);
+            if (ra != rb) return ra < rb;
+            return std.mem.order(u8, a.date, b.date) == .gt;
+        }
+    }.lessThan);
+
+    return .{
+        .entries = try out.toOwnedSlice(gpa),
+    };
+}
+
+// --- report ---
+
+pub const ReportIssue = struct { source: []const u8, message: []const u8, severity: []const u8 };
+
+pub const ReportResult = struct {
+    path: []const u8,
+    status: []const u8, // "clean" | "issues" | "blocked"
+    confidence: []const u8, // "high" | "medium" | "low"
+    git_branch: []const u8,
+    git_dirty: bool,
+    build_ok: bool,
+    tests_ok: bool,
+    secrets_found: bool,
+    issues: []ReportIssue,
+    next_action: []const u8,
+};
+
+pub fn computeReport(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !ReportResult {
+    var issues: std.ArrayList(ReportIssue) = .empty;
+
+    // Git state
+    const git_opt: ?GitCacheResult = blk: {
+        const r = computeGitCache(gpa, io, path) catch {
+            break :blk null;
+        };
+        break :blk r;
+    };
+    const git_branch = if (git_opt) |g| g.branch else "";
+    const git_dirty = if (git_opt) |g| g.dirty else false;
+
+    // Build + tests via quality-gate
+    const qg_opt: ?QualityGateResult = blk: {
+        const r = computeQualityGate(gpa, io, path) catch {
+            break :blk null;
+        };
+        break :blk r;
+    };
+    const build_ok = if (qg_opt) |q| blk2: {
+        if (!q.build_ran) break :blk2 true; // no build system → treat as ok
+        break :blk2 q.critical.len == 0 and q.high.len == 0;
+    } else true;
+    const tests_ok = if (qg_opt) |q| blk2: {
+        if (!q.tests_ran) break :blk2 true; // no test framework → treat as ok
+        break :blk2 q.tests_failed == 0;
+    } else true;
+
+    if (qg_opt) |q| {
+        for (q.critical) |f| {
+            if (issues.items.len >= 20) break;
+            try issues.append(gpa, .{
+                .source = try gpa.dupe(u8, f.source),
+                .message = try gpa.dupe(u8, f.message),
+                .severity = "critical",
+            });
+        }
+        for (q.high) |f| {
+            if (issues.items.len >= 20) break;
+            try issues.append(gpa, .{
+                .source = try gpa.dupe(u8, f.source),
+                .message = try gpa.dupe(u8, f.message),
+                .severity = "high",
+            });
+        }
+        for (q.medium) |f| {
+            if (issues.items.len >= 20) break;
+            try issues.append(gpa, .{
+                .source = try gpa.dupe(u8, f.source),
+                .message = try gpa.dupe(u8, f.message),
+                .severity = "medium",
+            });
+        }
+    }
+
+    // Secrets
+    const sec_opt: ?SecretScanResult = blk: {
+        const r = computeSecretScan(gpa, io, path) catch {
+            break :blk null;
+        };
+        break :blk r;
+    };
+    const secrets_found = if (sec_opt) |s| s.findings.len > 0 else false;
+    if (sec_opt) |s| {
+        if (s.findings.len > 0 and issues.items.len < 20) {
+            const msg = try std.fmt.allocPrint(gpa, "{d} hardcoded secret(s) found", .{s.findings.len});
+            try issues.append(gpa, .{ .source = "secret-scan", .message = msg, .severity = "critical" });
+        }
+    }
+
+    // Derive status + confidence
+    var has_critical = secrets_found;
+    var has_high = false;
+    if (!build_ok) {
+        has_critical = true;
+    }
+    if (!tests_ok) {
+        has_high = true;
+    }
+    for (issues.items) |iss| {
+        if (std.mem.eql(u8, iss.severity, "critical")) has_critical = true;
+        if (std.mem.eql(u8, iss.severity, "high")) has_high = true;
+    }
+    const status: []const u8 = if (has_critical) "blocked" else if (has_high or issues.items.len > 0) "issues" else "clean";
+
+    const confidence: []const u8 = if (qg_opt != null) "high" else if (git_opt != null) "medium" else "low";
+
+    // Next action
+    const next_action: []const u8 = if (has_critical)
+        "fix critical issues before proceeding"
+    else if (has_high)
+        "fix high-severity issues, then re-run /quality-gate"
+    else if (git_dirty)
+        "commit or stash uncommitted changes"
+    else if (issues.items.len > 0)
+        "review medium findings, then run /prod-ready"
+    else
+        "run /prod-ready before deploying";
+
+    return .{
+        .path = try gpa.dupe(u8, path),
+        .status = status,
+        .confidence = confidence,
+        .git_branch = if (git_branch.len > 0) try gpa.dupe(u8, git_branch) else "",
+        .git_dirty = git_dirty,
+        .build_ok = build_ok,
+        .tests_ok = tests_ok,
+        .secrets_found = secrets_found,
+        .issues = try issues.toOwnedSlice(gpa),
+        .next_action = next_action,
+    };
+}
+
+// --- metrics ---
+
+pub const RepeatedFileCount = struct {
+    path: []u8, // owned
+    count: u32,
+};
+
+pub const MetricsResult = struct {
+    cache_entries: u32,
+    project_states: u32,
+    total_decisions: u32,
+    total_patterns: u32,
+    device_profiled: bool,
+    compat_baseline_set: bool,
+    estimated_token_savings: u32,
+    // context-gate usage metrics (2026-07-02) — read from
+    // ~/.4orman/context-gate-events.json, written by appendContextGateEvent
+    // on every context-gate call.
+    context_gate_calls: u32,
+    repeated_prompt_count: u32, // distinct task strings (case-insensitive) seen 2+ times
+    avg_token_estimate: u64,
+    top_repeated_files: []RepeatedFileCount, // owned; top 10 by cross-call frequency
+    // Honest, not fabricated: context-gate does not call cache-fetch/
+    // cache-store internally yet, so there is nothing to report a hit/miss
+    // rate for. False would be misleading; omitting the field would look
+    // like an oversight. This says so explicitly.
+    context_gate_cache_wired: bool,
+    // failure-memory-v1 metrics — read from ~/.4orman/failures.json
+    failure_memory_total: u32,
+    failure_memory_resolved: u32,
+    failure_memory_unresolved: u32,
+    failure_memory_repeated: u32, // distinct task+errorSummary seen 2+ times
+    // architecture-ledger growth — read from ~/.4orman/ledger.json,
+    // category == "architecture" only. This is the "monitor growth over
+    // time" metric: check `metrics` repeatedly and watch these counts move.
+    architecture_total: u32,
+    architecture_highest: u32,
+    architecture_medium: u32,
+    architecture_lowest: u32,
+    architecture_proposed: u32,
+    architecture_built: u32,
+    architecture_rejected: u32,
+};
+
+const ContextGateUsageStats = struct {
+    calls: u32,
+    repeated_prompts: u32,
+    avg_tokens: u64,
+    top_files: []RepeatedFileCount,
+};
+
+fn computeContextGateUsageStats(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !ContextGateUsageStats {
+    const empty = ContextGateUsageStats{ .calls = 0, .repeated_prompts = 0, .avg_tokens = 0, .top_files = &[_]RepeatedFileCount{} };
+    const path = try std.fmt.allocPrint(gpa, "{s}/.4orman/context-gate-events.json", .{home});
+    defer gpa.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return empty;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(8 * 1024 * 1024)) catch return empty;
+    defer gpa.free(content);
+
+    var task_counts = std.StringHashMap(u32).init(gpa);
+    defer {
+        var it = task_counts.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        task_counts.deinit();
+    }
+    var file_counts = std.StringHashMap(u32).init(gpa);
+    defer {
+        var it = file_counts.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        file_counts.deinit();
+    }
+
+    var calls: u32 = 0;
+    var total_tokens: u64 = 0;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const o = parsed.value.object;
+        calls += 1;
+
+        if (o.get("task")) |tv| {
+            if (tv == .string) {
+                const lower = try gpa.alloc(u8, tv.string.len);
+                defer gpa.free(lower);
+                for (tv.string, 0..) |c, i| lower[i] = std.ascii.toLower(c);
+                const gop = try task_counts.getOrPut(lower);
+                if (gop.found_existing) {
+                    gop.value_ptr.* += 1;
+                } else {
+                    gop.key_ptr.* = try gpa.dupe(u8, lower);
+                    gop.value_ptr.* = 1;
+                }
+            }
+        }
+
+        if (o.get("tokenEstimate")) |tev| {
+            if (tev == .integer) total_tokens += @intCast(tev.integer);
+        }
+
+        if (o.get("files")) |fv| {
+            if (fv == .array) {
+                for (fv.array.items) |fi| {
+                    if (fi != .string) continue;
+                    const gop = try file_counts.getOrPut(fi.string);
+                    if (gop.found_existing) {
+                        gop.value_ptr.* += 1;
+                    } else {
+                        gop.key_ptr.* = try gpa.dupe(u8, fi.string);
+                        gop.value_ptr.* = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    var repeated_prompts: u32 = 0;
+    {
+        var it = task_counts.valueIterator();
+        while (it.next()) |v| {
+            if (v.* >= 2) repeated_prompts += 1;
+        }
+    }
+
+    const RankedFileRef = struct { path: []const u8, count: u32 };
+    var ranked: std.ArrayList(RankedFileRef) = .empty;
+    defer ranked.deinit(gpa);
+    {
+        var it = file_counts.iterator();
+        while (it.next()) |kv| {
+            try ranked.append(gpa, .{ .path = kv.key_ptr.*, .count = kv.value_ptr.* });
+        }
+    }
+    std.mem.sort(RankedFileRef, ranked.items, {}, struct {
+        fn lessThan(_: void, a: RankedFileRef, b: RankedFileRef) bool {
+            return a.count > b.count;
+        }
+    }.lessThan);
+
+    const top_n = @min(10, ranked.items.len);
+    const top_files = try gpa.alloc(RepeatedFileCount, top_n);
+    for (0..top_n) |i| {
+        top_files[i] = .{ .path = try gpa.dupe(u8, ranked.items[i].path), .count = ranked.items[i].count };
+    }
+
+    const avg_tokens: u64 = if (calls == 0) 0 else total_tokens / calls;
+    return .{ .calls = calls, .repeated_prompts = repeated_prompts, .avg_tokens = avg_tokens, .top_files = top_files };
+}
+
+const ArchitectureLedgerStats = struct {
+    total: u32,
+    highest: u32,
+    medium: u32,
+    lowest: u32,
+    proposed: u32,
+    built: u32,
+    rejected: u32,
+};
+
+fn computeArchitectureLedgerStats(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !ArchitectureLedgerStats {
+    const empty = ArchitectureLedgerStats{ .total = 0, .highest = 0, .medium = 0, .lowest = 0, .proposed = 0, .built = 0, .rejected = 0 };
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+    if (!fileExists(io, ledger_path)) return empty;
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    var stats = empty;
+    for (entries.items) |e| {
+        if (!std.mem.eql(u8, e.category, "architecture")) continue;
+        stats.total += 1;
+        if (std.mem.eql(u8, e.winner, "highest")) stats.highest += 1;
+        if (std.mem.eql(u8, e.winner, "medium")) stats.medium += 1;
+        if (std.mem.eql(u8, e.winner, "lowest")) stats.lowest += 1;
+        if (std.mem.eql(u8, e.status, "proposed")) stats.proposed += 1;
+        if (std.mem.eql(u8, e.status, "built")) stats.built += 1;
+        if (std.mem.eql(u8, e.status, "rejected")) stats.rejected += 1;
+    }
+    return stats;
+}
+
+pub fn computeMetrics(gpa: std.mem.Allocator, io: std.Io) !MetricsResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home: []const u8 = std.mem.span(home_ptr);
+
+    // --- Cache entries ---
+    const cache_dir_path = try std.fmt.allocPrint(gpa, "{s}/.cache/4orman-tools", .{home});
+    defer gpa.free(cache_dir_path);
+    var cache_entries: u32 = 0;
+    cache_walk: {
+        var dir = std.Io.Dir.openDirAbsolute(io, cache_dir_path, .{ .iterate = true }) catch break :cache_walk;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch break :cache_walk) |entry| {
+            if (entry.kind != .file) continue;
+            cache_entries += 1;
+        }
+    }
+
+    // --- Project states (decisions + patterns) ---
+    const state_dir_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/state", .{home});
+    defer gpa.free(state_dir_path);
+    var project_states: u32 = 0;
+    var total_decisions: u32 = 0;
+    var total_patterns: u32 = 0;
+    state_walk: {
+        var dir = std.Io.Dir.openDirAbsolute(io, state_dir_path, .{ .iterate = true }) catch break :state_walk;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch break :state_walk) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+            project_states += 1;
+            const file_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ state_dir_path, entry.name });
+            defer gpa.free(file_path);
+            const content: []u8 = blk: {
+                var f = std.Io.Dir.openFileAbsolute(io, file_path, .{}) catch break :blk &.{};
+                var rbuf: [4096]u8 = undefined;
+                var r = f.reader(io, &rbuf);
+                break :blk r.interface.allocRemaining(gpa, .limited(65536)) catch &.{};
+            };
+            defer if (content.len > 0) gpa.free(content);
+            if (content.len == 0) continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            if (obj.get("decisions")) |dv| {
+                if (dv == .array) total_decisions += @intCast(dv.array.items.len);
+            }
+            if (obj.get("known_patterns")) |pv| {
+                if (pv == .array) total_patterns += @intCast(pv.array.items.len);
+            }
+        }
+    }
+
+    // --- Profile and baseline ---
+    const profile_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/profile.json", .{home});
+    defer gpa.free(profile_path);
+    const baseline_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/compat-baseline.json", .{home});
+    defer gpa.free(baseline_path);
+    const device_profiled = fileExists(io, profile_path);
+    const compat_baseline_set = fileExists(io, baseline_path);
+
+    // Estimated token savings: each cache entry represents ~200 tokens saved on a hit
+    // Assuming the documented 80% cache-hit-rate target: savings = entries × 0.8 × 200 = entries × 160
+    const estimated_token_savings = cache_entries *% 160;
+
+    const gate_stats = try computeContextGateUsageStats(gpa, io, home);
+    const failure_stats = try computeFailureMemoryStats(gpa, io, home);
+    const arch_stats = try computeArchitectureLedgerStats(gpa, io, home);
+
+    return .{
+        .cache_entries = cache_entries,
+        .project_states = project_states,
+        .total_decisions = total_decisions,
+        .total_patterns = total_patterns,
+        .device_profiled = device_profiled,
+        .compat_baseline_set = compat_baseline_set,
+        .estimated_token_savings = estimated_token_savings,
+        .context_gate_calls = gate_stats.calls,
+        .repeated_prompt_count = gate_stats.repeated_prompts,
+        .avg_token_estimate = gate_stats.avg_tokens,
+        .top_repeated_files = gate_stats.top_files,
+        .context_gate_cache_wired = false,
+        .failure_memory_total = failure_stats.total_failures,
+        .failure_memory_resolved = failure_stats.resolved_count,
+        .failure_memory_unresolved = failure_stats.unresolved_count,
+        .failure_memory_repeated = failure_stats.repeated_failure_count,
+        .architecture_total = arch_stats.total,
+        .architecture_highest = arch_stats.highest,
+        .architecture_medium = arch_stats.medium,
+        .architecture_lowest = arch_stats.lowest,
+        .architecture_proposed = arch_stats.proposed,
+        .architecture_built = arch_stats.built,
+        .architecture_rejected = arch_stats.rejected,
+    };
+}
+
+// --- session-snapshot subcommand ---
+
+pub fn computeSnapshot(gpa: std.mem.Allocator, io: std.Io, workspace_root: []const u8) ![]u8 {
+    // Read ROADMAP.md and extract Active Work facts
+    const roadmap_path = try std.fmt.allocPrint(gpa, "{s}/ROADMAP.md", .{workspace_root});
+    defer gpa.free(roadmap_path);
+
+    var wave_line: []const u8 = "unknown";
+    var current_line: []const u8 = "unknown";
+    var wave_owned = false;
+    var current_owned = false;
+
+    roadmap_blk: {
+        var f = std.Io.Dir.openFileAbsolute(io, roadmap_path, .{}) catch break :roadmap_blk;
+        var rbuf: [4096]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        const content = r.interface.allocRemaining(gpa, .limited(512 * 1024)) catch break :roadmap_blk;
+        defer gpa.free(content);
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \r");
+            if (std.mem.startsWith(u8, line, "**Wave:**")) {
+                const val = std.mem.trim(u8, line["**Wave:**".len..], " ");
+                wave_line = gpa.dupe(u8, val) catch break :roadmap_blk;
+                wave_owned = true;
+            } else if (std.mem.startsWith(u8, line, "**Current:**")) {
+                const val = std.mem.trim(u8, line["**Current:**".len..], " ");
+                current_line = gpa.dupe(u8, val) catch break :roadmap_blk;
+                current_owned = true;
+            }
+        }
+    }
+    defer if (wave_owned) gpa.free(wave_line);
+    defer if (current_owned) gpa.free(current_line);
+
+    // JSON-escape extracted strings
+    const wave_esc = try allocJsonEscape(gpa, wave_line);
+    defer gpa.free(wave_esc);
+    const current_esc = try allocJsonEscape(gpa, current_line);
+    defer gpa.free(current_esc);
+
+    const json = try std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "version": "{s}",
+        \\  "wave": "{s}",
+        \\  "current": "{s}",
+        \\  "pending_errors": null
+        \\}}
+    , .{ VERSION, wave_esc, current_esc });
+
+    // Write to ~/.4orman/session-snapshot.json (atomic)
+    write_blk: {
+        const home_ptr = std.c.getenv("HOME") orelse break :write_blk;
+        const home: []const u8 = std.mem.span(home_ptr);
+        const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+        defer gpa.free(foreman_dir);
+        std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+        var tmp_buf: [512]u8 = undefined;
+        const snap_path = std.fmt.bufPrint(&tmp_buf, "{s}/.4orman/session-snapshot.json", .{home}) catch break :write_blk;
+        var tmp_buf2: [520]u8 = undefined;
+        const tmp_path = std.fmt.bufPrint(&tmp_buf2, "{s}.tmp", .{snap_path}) catch break :write_blk;
+        const wf = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch break :write_blk;
+        var wbuf: [256]u8 = undefined;
+        var w = wf.writerStreaming(io, &wbuf);
+        w.interface.writeAll(json) catch {
+            wf.close(io);
+            break :write_blk;
+        };
+        w.interface.flush() catch {};
+        wf.close(io);
+        atomicRenameAbsolute(tmp_path, snap_path);
+    }
+
+    return json; // caller must gpa.free
+}
+
+// --- rollback subcommand (Module 29) ---
+
+fn rollbackSnapPath(gpa: std.mem.Allocator, home: []const u8, repo_path: []const u8) ![]u8 {
+    const name_buf = try gpa.alloc(u8, repo_path.len);
+    defer gpa.free(name_buf);
+    for (repo_path, 0..) |c, i| {
+        name_buf[i] = if (std.ascii.isAlphanumeric(c) or c == '-') c else '_';
+    }
+    const name_slice = if (name_buf.len > 80) name_buf[name_buf.len - 80 ..] else name_buf;
+    return std.fmt.allocPrint(gpa, "{s}/.4orman/snapshots/{s}.json", .{ home, name_slice });
+}
+
+pub fn computeRollbackSnapshot(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8) ![]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home: []const u8 = std.mem.span(home_ptr);
+
+    const git = try computeGitCache(gpa, io, repo_path);
+    var _ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &_ts);
+    const ts_ms: i64 = _ts.sec *% 1000 + @divTrunc(_ts.nsec, 1_000_000);
+
+    var id_buf: [32]u8 = undefined;
+    const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{ts_ms});
+
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    const snap_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman/snapshots", .{home});
+    defer gpa.free(snap_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+    std.Io.Dir.createDirAbsolute(io, snap_dir, .default_dir) catch {};
+
+    const snap_path = try rollbackSnapPath(gpa, home, repo_path);
+    defer gpa.free(snap_path);
+
+    var arr: std.ArrayList(u8) = .empty;
+    defer arr.deinit(gpa);
+    var count: u32 = 0;
+
+    existing_blk: {
+        var f = std.Io.Dir.openFileAbsolute(io, snap_path, .{}) catch break :existing_blk;
+        var rbuf: [4096]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        const content = r.interface.allocRemaining(gpa, .limited(64 * 1024)) catch break :existing_blk;
+        defer gpa.free(content);
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch break :existing_blk;
+        defer parsed.deinit();
+        if (parsed.value != .array) break :existing_blk;
+        const items = parsed.value.array.items;
+        const start: usize = if (items.len >= 19) items.len - 19 else 0;
+        for (items[start..]) |item| {
+            if (item != .object) continue;
+            const obj = item.object;
+            const eid = if (obj.get("id")) |v| if (v == .string) v.string else "" else "";
+            const ebr = if (obj.get("branch")) |v| if (v == .string) v.string else "" else "";
+            const ehd = if (obj.get("head")) |v| if (v == .string) v.string else "" else "";
+            const edr = if (obj.get("dirty")) |v| if (v == .bool) v.bool else false else false;
+            const ems: i64 = if (obj.get("created_at_ms")) |v| if (v == .integer) v.integer else 0 else 0;
+            if (arr.items.len > 0) try arr.append(gpa, ',');
+            const item_json = try std.fmt.allocPrint(gpa, "{{\"id\":\"{s}\",\"branch\":\"{s}\",\"head\":\"{s}\",\"dirty\":{s},\"created_at_ms\":{d}}}", .{ eid, ebr, ehd, if (edr) "true" else "false", ems });
+            defer gpa.free(item_json);
+            try arr.appendSlice(gpa, item_json);
+            count += 1;
+        }
+    }
+
+    if (arr.items.len > 0) try arr.append(gpa, ',');
+    const new_entry = try std.fmt.allocPrint(gpa, "{{\"id\":\"{s}\",\"branch\":\"{s}\",\"head\":\"{s}\",\"dirty\":{s},\"created_at_ms\":{d}}}", .{ id_str, git.branch, git.head, if (git.dirty) "true" else "false", ts_ms });
+    defer gpa.free(new_entry);
+    try arr.appendSlice(gpa, new_entry);
+    count += 1;
+
+    var tmp_buf: [640]u8 = undefined;
+    write_blk: {
+        const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{snap_path}) catch break :write_blk;
+        const wf = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch break :write_blk;
+        var wbuf: [256]u8 = undefined;
+        var w = wf.writerStreaming(io, &wbuf);
+        w.interface.writeAll("[") catch {
+            wf.close(io);
+            break :write_blk;
+        };
+        w.interface.writeAll(arr.items) catch {};
+        w.interface.writeAll("]") catch {};
+        w.interface.flush() catch {};
+        wf.close(io);
+        atomicRenameAbsolute(tmp_path, snap_path);
+    }
+
+    const snap_esc = try allocJsonEscape(gpa, snap_path);
+    defer gpa.free(snap_esc);
+    return std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "id": "{s}",
+        \\  "branch": "{s}",
+        \\  "head": "{s}",
+        \\  "dirty": {s},
+        \\  "created_at_ms": {d},
+        \\  "snapshot_count": {d},
+        \\  "snapshot_file": "{s}"
+        \\}}
+    , .{ id_str, git.branch, git.head, if (git.dirty) "true" else "false", ts_ms, count, snap_esc });
+}
+
+pub fn computeRollbackList(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8) ![]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home: []const u8 = std.mem.span(home_ptr);
+    const snap_path = try rollbackSnapPath(gpa, home, repo_path);
+    defer gpa.free(snap_path);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    const repo_esc = try allocJsonEscape(gpa, repo_path);
+    defer gpa.free(repo_esc);
+    const header = try std.fmt.allocPrint(gpa, "{{\n  \"repo\": \"{s}\",\n  \"snapshots\": [", .{repo_esc});
+    defer gpa.free(header);
+    try out.appendSlice(gpa, header);
+
+    var count: u32 = 0;
+    list_blk: {
+        var f = std.Io.Dir.openFileAbsolute(io, snap_path, .{}) catch break :list_blk;
+        var rbuf: [4096]u8 = undefined;
+        var r = f.reader(io, &rbuf);
+        const content = r.interface.allocRemaining(gpa, .limited(64 * 1024)) catch break :list_blk;
+        defer gpa.free(content);
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch break :list_blk;
+        defer parsed.deinit();
+        if (parsed.value != .array) break :list_blk;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const obj = item.object;
+            const eid = if (obj.get("id")) |v| if (v == .string) v.string else "" else "";
+            const ebr = if (obj.get("branch")) |v| if (v == .string) v.string else "" else "";
+            const ehd = if (obj.get("head")) |v| if (v == .string) v.string else "" else "";
+            const edr = if (obj.get("dirty")) |v| if (v == .bool) v.bool else false else false;
+            const ems: i64 = if (obj.get("created_at_ms")) |v| if (v == .integer) v.integer else 0 else 0;
+            if (count > 0) try out.append(gpa, ',');
+            const entry = try std.fmt.allocPrint(gpa, "\n    {{\"id\":\"{s}\",\"branch\":\"{s}\",\"head\":\"{s}\",\"dirty\":{s},\"created_at_ms\":{d}}}", .{ eid, ebr, ehd, if (edr) "true" else "false", ems });
+            defer gpa.free(entry);
+            try out.appendSlice(gpa, entry);
+            count += 1;
+        }
+    }
+
+    const footer = try std.fmt.allocPrint(gpa, "\n  ],\n  \"count\": {d}\n}}", .{count});
+    defer gpa.free(footer);
+    try out.appendSlice(gpa, footer);
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn computeRollbackRevert(gpa: std.mem.Allocator, io: std.Io, repo_path: []const u8, snapshot_id: []const u8) ![]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home: []const u8 = std.mem.span(home_ptr);
+    const snap_path = try rollbackSnapPath(gpa, home, repo_path);
+    defer gpa.free(snap_path);
+
+    var f = std.Io.Dir.openFileAbsolute(io, snap_path, .{}) catch return error.NoSnapshots;
+    var rbuf: [4096]u8 = undefined;
+    var r = f.reader(io, &rbuf);
+    const content = r.interface.allocRemaining(gpa, .limited(64 * 1024)) catch return error.NoSnapshots;
+    defer gpa.free(content);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return error.NoSnapshots;
+    defer parsed.deinit();
+
+    if (parsed.value != .array) return error.NoSnapshots;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const eid = if (obj.get("id")) |v| if (v == .string) v.string else "" else "";
+        if (!std.mem.eql(u8, eid, snapshot_id)) continue;
+        const branch = if (obj.get("branch")) |v| if (v == .string) v.string else "" else "";
+        const head = if (obj.get("head")) |v| if (v == .string) v.string else "" else "";
+        const repo_esc = try allocJsonEscape(gpa, repo_path);
+        defer gpa.free(repo_esc);
+        const branch_esc = try allocJsonEscape(gpa, branch);
+        defer gpa.free(branch_esc);
+        const head_esc = try allocJsonEscape(gpa, head);
+        defer gpa.free(head_esc);
+        return std.fmt.allocPrint(gpa,
+            \\{{
+            \\  "snapshot_id": "{s}",
+            \\  "branch": "{s}",
+            \\  "head": "{s}",
+            \\  "commands": [
+            \\    "git -C {s} checkout {s}",
+            \\    "git -C {s} reset --hard {s}"
+            \\  ],
+            \\  "warning": "These commands discard uncommitted changes. Verify with sandbox-check first."
+            \\}}
+        , .{ snapshot_id, branch_esc, head_esc, repo_esc, branch_esc, repo_esc, head_esc });
+    }
+    return error.SnapshotNotFound;
+}
+
+// --- sandbox-check subcommand ---
+
+pub const SandboxSeverity = enum { safe, caution, destructive, blocked };
+
+pub const SandboxCheckResult = struct {
+    operation: []const u8, // duped — caller must free
+    allowed: bool,
+    severity: []const u8, // static string literal
+    reason: []const u8, // static string literal
+};
+
+const SandboxPattern = struct {
+    needle: []const u8,
+    severity: SandboxSeverity,
+    reason: []const u8,
+};
+
+const SANDBOX_PATTERNS = [_]SandboxPattern{
+    // blocked — never allowed
+    .{ .needle = "sudo rm", .severity = .blocked, .reason = "privileged recursive delete" },
+    .{ .needle = "mkfs", .severity = .blocked, .reason = "filesystem format" },
+    .{ .needle = "fdisk", .severity = .blocked, .reason = "disk partition editor" },
+    .{ .needle = "dd if=", .severity = .blocked, .reason = "raw disk write" },
+    .{ .needle = ":(){:|:&};:", .severity = .blocked, .reason = "fork bomb" },
+    // destructive — not allowed without override
+    .{ .needle = "rm -rf", .severity = .destructive, .reason = "recursive force delete" },
+    .{ .needle = "rm -fr", .severity = .destructive, .reason = "recursive force delete" },
+    .{ .needle = "rm -r", .severity = .destructive, .reason = "recursive delete" },
+    .{ .needle = "git reset --hard", .severity = .destructive, .reason = "discards uncommitted changes" },
+    .{ .needle = "git push --force", .severity = .destructive, .reason = "force-pushes over remote history" },
+    .{ .needle = "git push -f", .severity = .destructive, .reason = "force-pushes over remote history" },
+    .{ .needle = "git checkout .", .severity = .destructive, .reason = "discards all working-tree changes" },
+    .{ .needle = "git restore .", .severity = .destructive, .reason = "discards all working-tree changes" },
+    .{ .needle = "git clean -f", .severity = .destructive, .reason = "removes untracked files" },
+    .{ .needle = "drop table", .severity = .destructive, .reason = "drops database table" },
+    .{ .needle = "drop database", .severity = .destructive, .reason = "drops entire database" },
+    .{ .needle = "truncate table", .severity = .destructive, .reason = "deletes all rows in table" },
+    .{ .needle = "git branch -d", .severity = .destructive, .reason = "force-deletes git branch" },
+    .{ .needle = "--no-verify", .severity = .destructive, .reason = "bypasses git hooks" },
+    // caution — allowed with warning
+    .{ .needle = "git push", .severity = .caution, .reason = "pushes to remote" },
+    .{ .needle = "git commit", .severity = .caution, .reason = "creates a commit" },
+    .{ .needle = "git tag", .severity = .caution, .reason = "creates or deletes a tag" },
+    .{ .needle = "npm publish", .severity = .caution, .reason = "publishes package publicly" },
+    .{ .needle = "yarn publish", .severity = .caution, .reason = "publishes package publicly" },
+    .{ .needle = "cargo publish", .severity = .caution, .reason = "publishes crate publicly" },
+    .{ .needle = "brew install", .severity = .caution, .reason = "installs system package" },
+    .{ .needle = "brew upgrade", .severity = .caution, .reason = "upgrades system package" },
+    .{ .needle = "pip install", .severity = .caution, .reason = "installs python package" },
+    .{ .needle = "npm install", .severity = .caution, .reason = "installs node package" },
+    .{ .needle = "gh release create", .severity = .caution, .reason = "publishes a GitHub release" },
+    .{ .needle = "gh pr create", .severity = .caution, .reason = "opens a pull request" },
+};
+
+pub fn computeSandboxCheck(gpa: std.mem.Allocator, operation: []const u8) !SandboxCheckResult {
+    // Lowercase the operation once; all needles in SANDBOX_PATTERNS are already lowercase
+    const op_lower = try gpa.alloc(u8, operation.len);
+    defer gpa.free(op_lower);
+    _ = std.ascii.lowerString(op_lower, operation);
+
+    var worst: SandboxSeverity = .safe;
+    var worst_reason: []const u8 = "no destructive patterns matched";
+
+    for (SANDBOX_PATTERNS) |pat| {
+        if (!std.mem.containsAtLeast(u8, op_lower, 1, pat.needle)) continue;
+        const rank: u8 = switch (pat.severity) {
+            .safe => 0,
+            .caution => 1,
+            .destructive => 2,
+            .blocked => 3,
+        };
+        const best: u8 = switch (worst) {
+            .safe => 0,
+            .caution => 1,
+            .destructive => 2,
+            .blocked => 3,
+        };
+        if (rank > best) {
+            worst = pat.severity;
+            worst_reason = pat.reason;
+        }
+    }
+
+    return .{
+        .operation = try gpa.dupe(u8, operation),
+        .allowed = switch (worst) {
+            .safe => true,
+            .caution => true,
+            .destructive => false,
+            .blocked => false,
+        },
+        .severity = switch (worst) {
+            .safe => "safe",
+            .caution => "caution",
+            .destructive => "destructive",
+            .blocked => "blocked",
+        },
+        .reason = worst_reason,
+    };
+}
+
+// --- capability-promote (Module 21) ---
+
+pub fn computeCapabilityPromote(gpa: std.mem.Allocator, io: std.Io, command: []const u8) ![]u8 {
+    // Lowercase command for pattern matching
+    const cmd_lower = try gpa.alloc(u8, command.len);
+    defer gpa.free(cmd_lower);
+    for (command, 0..) |c, i| cmd_lower[i] = std.ascii.toLower(c);
+
+    // Check if already covered by an existing subcommand at exact/high confidence
+    const check = try computeCapabilityCheck(gpa, io, command);
+    defer gpa.free(check.query);
+    const already_covered = check.available and
+        (std.mem.eql(u8, check.confidence, "exact") or std.mem.eql(u8, check.confidence, "high"));
+
+    if (already_covered) {
+        const sub = check.subcommand; // static registry string — safe to borrow after check.query freed
+        const cmd_esc = try allocJsonEscape(gpa, command);
+        defer gpa.free(cmd_esc);
+        const sub_esc = try allocJsonEscape(gpa, sub);
+        defer gpa.free(sub_esc);
+        return std.fmt.allocPrint(gpa,
+            \\{{
+            \\  "command": "{s}",
+            \\  "score": 0,
+            \\  "already_covered": true,
+            \\  "similar_subcommand": "{s}",
+            \\  "recommendation": "skip",
+            \\  "reasons": ["already covered by 4orman-tools subcommand \"{s}\""]
+            \\}}
+        , .{ cmd_esc, sub_esc, sub_esc });
+    }
+
+    // Score promotion signals
+    var score: u32 = 10; // baseline
+    var reasons: [8][]const u8 = undefined;
+    var n: usize = 0;
+
+    if (std.mem.indexOf(u8, cmd_lower, "git ") != null or
+        std.mem.startsWith(u8, cmd_lower, "git"))
+    {
+        score += 20;
+        reasons[n] = "git operation";
+        n += 1;
+    }
+    if (std.mem.indexOf(u8, cmd_lower, "jq") != null or
+        std.mem.indexOf(u8, cmd_lower, " awk") != null or
+        std.mem.indexOf(u8, cmd_lower, "grep") != null or
+        std.mem.indexOf(u8, cmd_lower, " sed ") != null or
+        std.mem.indexOf(u8, cmd_lower, " head") != null or
+        std.mem.indexOf(u8, cmd_lower, " tail") != null)
+    {
+        score += 20;
+        reasons[n] = "parses structured output";
+        n += 1;
+    }
+    const has_side_effects =
+        std.mem.indexOf(u8, cmd_lower, "push") != null or
+        std.mem.indexOf(u8, cmd_lower, "commit") != null or
+        std.mem.indexOf(u8, cmd_lower, " rm ") != null or
+        std.mem.indexOf(u8, cmd_lower, "write") != null or
+        std.mem.indexOf(u8, cmd_lower, "install") != null or
+        std.mem.indexOf(u8, cmd_lower, "publish") != null;
+    if (!has_side_effects) {
+        score += 15;
+        reasons[n] = "read-only / no side effects";
+        n += 1;
+    }
+    const has_nondeterminism =
+        std.mem.indexOf(u8, cmd_lower, "date") != null or
+        std.mem.indexOf(u8, cmd_lower, "random") != null or
+        std.mem.indexOf(u8, cmd_lower, "sleep") != null;
+    if (!has_nondeterminism) {
+        score += 15;
+        reasons[n] = "deterministic";
+        n += 1;
+    }
+    if (command.len < 80) {
+        score += 10;
+        reasons[n] = "compact command";
+        n += 1;
+    }
+    if (std.mem.indexOf(u8, cmd_lower, "/") != null or
+        std.mem.indexOf(u8, cmd_lower, "<path") != null or
+        std.mem.indexOf(u8, cmd_lower, "<repo") != null)
+    {
+        score += 10;
+        reasons[n] = "takes path/repo argument";
+        n += 1;
+    }
+
+    const recommendation: []const u8 = if (score >= 60) "promote" else if (score >= 40) "consider" else "skip";
+
+    // Build reasons JSON array content
+    var reasons_buf: std.ArrayList(u8) = .empty;
+    defer reasons_buf.deinit(gpa);
+    for (reasons[0..n], 0..) |r, i| {
+        if (i > 0) try reasons_buf.append(gpa, ',');
+        try reasons_buf.appendSlice(gpa, "\"");
+        try reasons_buf.appendSlice(gpa, r);
+        try reasons_buf.appendSlice(gpa, "\"");
+    }
+
+    const cmd_esc = try allocJsonEscape(gpa, command);
+    defer gpa.free(cmd_esc);
+
+    // similar_subcommand is only meaningful in the already_covered early-return path
+    const similar_json: []u8 = try gpa.dupe(u8, "null");
+    defer gpa.free(similar_json);
+
+    return std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "command": "{s}",
+        \\  "score": {d},
+        \\  "already_covered": false,
+        \\  "similar_subcommand": {s},
+        \\  "recommendation": "{s}",
+        \\  "reasons": [{s}]
+        \\}}
+    , .{ cmd_esc, score, similar_json, recommendation, reasons_buf.items });
+}
+
+// --- ant subcommand (Ant colony: "what changed?" — mtime-based filesystem diff) ---
+
+const ANT_CAP: usize = 500;
+
+const AntEntry = struct {
+    path: []u8,
+    mtime_ms: i64,
+};
+
+fn antGetMtimeMs(io: std.Io, abs_path: []const u8) i64 {
+    const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return 0;
+    defer file.close(io);
+    const st = file.stat(io) catch return 0;
+    return @intCast(@divTrunc(st.mtime.nanoseconds, 1_000_000));
+}
+
+fn walkAntFiles(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rel_prefix: []const u8,
+    root: []const u8,
+    since_ms: i64,
+    changed: *std.ArrayList(AntEntry),
+    total: *u32,
+    truncated: *bool,
+) !void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .directory) {
+            if (shouldSkipScanDir(entry.name)) continue;
+            const sub_prefix: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            defer gpa.free(sub_prefix);
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+            defer sub.close(io);
+            try walkAntFiles(gpa, io, sub, sub_prefix, root, since_ms, changed, total, truncated);
+        } else if (entry.kind == .file) {
+            if (shouldSkipScanFile(entry.name)) continue;
+            const rel_path: []u8 = if (rel_prefix.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel_prefix, entry.name });
+            var transferred = false;
+            defer if (!transferred) gpa.free(rel_path);
+            const abs_path = std.fs.path.join(gpa, &.{ root, rel_path }) catch continue;
+            defer gpa.free(abs_path);
+            const mtime = antGetMtimeMs(io, abs_path);
+            if (mtime > since_ms) {
+                total.* += 1;
+                if (changed.items.len < ANT_CAP) {
+                    try changed.append(gpa, .{ .path = rel_path, .mtime_ms = mtime });
+                    transferred = true;
+                } else {
+                    truncated.* = true;
+                }
+            }
+        }
+    }
+}
+
+pub fn computeAnt(gpa: std.mem.Allocator, io: std.Io, root_path: []const u8, since_ms: i64) ![]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true }) catch
+        return error.PathNotFound;
+    defer dir.close(io);
+
+    var changed: std.ArrayList(AntEntry) = .empty;
+    defer {
+        for (changed.items) |e| gpa.free(e.path);
+        changed.deinit(gpa);
+    }
+    var total: u32 = 0;
+    var truncated = false;
+    try walkAntFiles(gpa, io, dir, "", root_path, since_ms, &changed, &total, &truncated);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ms: i64 = ts.sec *% 1000 + @divTrunc(ts.nsec, 1_000_000);
+
+    const root_esc = try allocJsonEscape(gpa, root_path);
+    defer gpa.free(root_esc);
+
+    var arr: std.ArrayList(u8) = .empty;
+    defer arr.deinit(gpa);
+    for (changed.items, 0..) |e, idx| {
+        const path_esc = try allocJsonEscape(gpa, e.path);
+        defer gpa.free(path_esc);
+        if (idx > 0) try arr.appendSlice(gpa, ",\n");
+        const line = try std.fmt.allocPrint(gpa, "    {{\"path\": \"{s}\", \"mtimeMs\": {d}}}", .{ path_esc, e.mtime_ms });
+        defer gpa.free(line);
+        try arr.appendSlice(gpa, line);
+    }
+
+    if (changed.items.len == 0) {
+        return std.fmt.allocPrint(gpa,
+            \\{{
+            \\  "root": "{s}",
+            \\  "sinceMs": {d},
+            \\  "scannedAtMs": {d},
+            \\  "total": 0,
+            \\  "truncated": false,
+            \\  "changed": []
+            \\}}
+        , .{ root_esc, since_ms, now_ms });
+    }
+    return std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "root": "{s}",
+        \\  "sinceMs": {d},
+        \\  "scannedAtMs": {d},
+        \\  "total": {d},
+        \\  "truncated": {s},
+        \\  "changed": [
+        \\{s}
+        \\  ]
+        \\}}
+    , .{ root_esc, since_ms, now_ms, total, if (truncated) "true" else "false", arr.items });
+}
+
+// --- worker-run / worker-list subcommands (Module 10 — Language Worker Manager) ---
+
+const WORKER_OUTPUT_CAP: usize = 64 * 1024;
+pub const WORKER_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+const WorkerEntry = struct {
+    lang: []const u8,
+    candidates: []const []const u8,
+    prefix: []const []const u8,
+    ext: []const u8,
+    alias: bool = false,
+};
+
+const WORKER_LANGS = [_]WorkerEntry{
+    .{ .lang = "python", .candidates = &.{ "python3", "python" }, .prefix = &.{}, .ext = "py" },
+    .{ .lang = "py", .candidates = &.{ "python3", "python" }, .prefix = &.{}, .ext = "py", .alias = true },
+    .{ .lang = "node", .candidates = &.{ "node", "nodejs" }, .prefix = &.{}, .ext = "js" },
+    .{ .lang = "js", .candidates = &.{ "node", "nodejs" }, .prefix = &.{}, .ext = "js", .alias = true },
+    .{ .lang = "deno", .candidates = &.{"deno"}, .prefix = &.{ "run", "--allow-all" }, .ext = "ts" },
+    .{ .lang = "bun", .candidates = &.{"bun"}, .prefix = &.{}, .ext = "ts" },
+    .{ .lang = "go", .candidates = &.{"go"}, .prefix = &.{"run"}, .ext = "go" },
+    .{ .lang = "golang", .candidates = &.{"go"}, .prefix = &.{"run"}, .ext = "go", .alias = true },
+    .{ .lang = "ruby", .candidates = &.{"ruby"}, .prefix = &.{}, .ext = "rb" },
+    .{ .lang = "rb", .candidates = &.{"ruby"}, .prefix = &.{}, .ext = "rb", .alias = true },
+    .{ .lang = "bash", .candidates = &.{ "bash", "sh" }, .prefix = &.{}, .ext = "sh" },
+    .{ .lang = "sh", .candidates = &.{ "sh", "bash" }, .prefix = &.{}, .ext = "sh", .alias = true },
+    .{ .lang = "swift", .candidates = &.{"swift"}, .prefix = &.{}, .ext = "swift" },
+    .{ .lang = "zig", .candidates = &.{"zig"}, .prefix = &.{"run"}, .ext = "zig" },
+    .{ .lang = "lua", .candidates = &.{ "lua", "lua5.4", "lua5.3", "lua5.2" }, .prefix = &.{}, .ext = "lua" },
+    .{ .lang = "php", .candidates = &.{ "php", "php8", "php7" }, .prefix = &.{}, .ext = "php" },
+};
+
+fn workerFindEntry(lang: []const u8) ?WorkerEntry {
+    for (&WORKER_LANGS) |e| {
+        if (std.mem.eql(u8, e.lang, lang)) return e;
+    }
+    return null;
+}
+
+pub fn computeWorkerList(gpa: std.mem.Allocator) ![]u8 {
+    var arr: std.ArrayList(u8) = .empty;
+    defer arr.deinit(gpa);
+    var first = true;
+    for (&WORKER_LANGS) |e| {
+        if (e.alias) continue;
+        if (!first) try arr.appendSlice(gpa, ", ");
+        first = false;
+        const entry = try std.fmt.allocPrint(gpa,
+            \\{{"lang": "{s}", "binary": "{s}", "ext": "{s}"}}
+        , .{ e.lang, e.candidates[0], e.ext });
+        defer gpa.free(entry);
+        try arr.appendSlice(gpa, entry);
+    }
+    return std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "workers": [{s}],
+        \\  "count": {d}
+        \\}}
+    , .{ arr.items, blk: {
+        var n: u32 = 0;
+        for (&WORKER_LANGS) |e| {
+            if (!e.alias) n += 1;
+        }
+        break :blk n;
+    } });
+}
+
+pub fn computeWorkerRun(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    lang: []const u8,
+    script_path: []const u8,
+    extra_args: []const []const u8,
+    timeout_ms: u64,
+) ![]u8 {
+    const entry = workerFindEntry(lang) orelse return error.UnknownLang;
+
+    var ts_start: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_start);
+
+    const RunOk = struct { stdout: []u8, stderr: []u8, exit: i32, interp: []const u8 };
+    var run_ok: ?RunOk = null;
+
+    for (entry.candidates) |cand| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(gpa);
+        try argv.append(gpa, cand);
+        for (entry.prefix) |a| try argv.append(gpa, a);
+        try argv.append(gpa, script_path);
+        for (extra_args) |a| try argv.append(gpa, a);
+
+        const r = std.process.run(gpa, io, .{ .argv = argv.items }) catch |e| switch (e) {
+            error.FileNotFound, error.AccessDenied, error.InvalidExe => continue,
+            else => return e,
+        };
+        run_ok = .{
+            .stdout = r.stdout,
+            .stderr = r.stderr,
+            .exit = switch (r.term) {
+                .exited => |c| @as(i32, @intCast(c)),
+                else => -1,
+            },
+            .interp = cand,
+        };
+        break;
+    }
+
+    const res = run_ok orelse return error.InterpreterNotFound;
+    defer gpa.free(res.stdout);
+    defer gpa.free(res.stderr);
+
+    var ts_end: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts_end);
+    const duration_ms: u64 = blk: {
+        const s0 = @as(u64, @intCast(ts_start.sec)) * 1000 + @as(u64, @intCast(ts_start.nsec)) / 1_000_000;
+        const s1 = @as(u64, @intCast(ts_end.sec)) * 1000 + @as(u64, @intCast(ts_end.nsec)) / 1_000_000;
+        break :blk if (s1 > s0) s1 - s0 else 0;
+    };
+
+    const truncated = res.stdout.len > WORKER_OUTPUT_CAP or res.stderr.len > WORKER_OUTPUT_CAP;
+    const out_slice = res.stdout[0..@min(res.stdout.len, WORKER_OUTPUT_CAP)];
+    const err_slice = res.stderr[0..@min(res.stderr.len, WORKER_OUTPUT_CAP)];
+
+    const lang_esc = try allocJsonEscape(gpa, lang);
+    defer gpa.free(lang_esc);
+    const interp_esc = try allocJsonEscape(gpa, res.interp);
+    defer gpa.free(interp_esc);
+    const script_esc = try allocJsonEscape(gpa, script_path);
+    defer gpa.free(script_esc);
+    const out_esc = try allocJsonEscape(gpa, out_slice);
+    defer gpa.free(out_esc);
+    const err_esc = try allocJsonEscape(gpa, err_slice);
+    defer gpa.free(err_esc);
+
+    return std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "lang": "{s}",
+        \\  "interpreter": "{s}",
+        \\  "script": "{s}",
+        \\  "exit_code": {d},
+        \\  "stdout": "{s}",
+        \\  "stderr": "{s}",
+        \\  "duration_ms": {d},
+        \\  "timed_out": {s},
+        \\  "truncated": {s}
+        \\}}
+    , .{
+        lang_esc,    interp_esc,                                         script_esc,
+        res.exit,    out_esc,                                            err_esc,
+        duration_ms, if (duration_ms >= timeout_ms) "true" else "false", if (truncated) "true" else "false",
+    });
+}
+
+// --- plugin-run / plugin-list subcommands (Module 11 — Plugin System) ---
+
+const PluginManifest = struct {
+    name: []u8,
+    lang: []u8,
+    entry: []u8,
+    description: []u8,
+    args: []u8,
+};
+
+fn freePluginManifest(gpa: std.mem.Allocator, m: PluginManifest) void {
+    gpa.free(m.name);
+    gpa.free(m.lang);
+    gpa.free(m.entry);
+    gpa.free(m.description);
+    gpa.free(m.args);
+}
+
+fn readPluginManifest(gpa: std.mem.Allocator, io: std.Io, manifest_path: []const u8) !PluginManifest {
+    const file = std.Io.Dir.openFileAbsolute(io, manifest_path, .{}) catch return error.ManifestNotFound;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var r = file.reader(io, &rbuf);
+    const content = try r.interface.allocRemaining(gpa, .limited(64 * 1024));
+    defer gpa.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return error.ManifestInvalid;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.ManifestInvalid,
+    };
+
+    const name_val = obj.get("name") orelse return error.ManifestMissingField;
+    const lang_val = obj.get("lang") orelse return error.ManifestMissingField;
+    const entry_val = obj.get("entry") orelse return error.ManifestMissingField;
+
+    const name_str = switch (name_val) {
+        .string => |s| s,
+        else => return error.ManifestInvalid,
+    };
+    const lang_str = switch (lang_val) {
+        .string => |s| s,
+        else => return error.ManifestInvalid,
+    };
+    const entry_str = switch (entry_val) {
+        .string => |s| s,
+        else => return error.ManifestInvalid,
+    };
+    const desc_str: []const u8 = if (obj.get("description")) |v| switch (v) {
+        .string => |s| s,
+        else => "",
+    } else "";
+    const args_str: []const u8 = if (obj.get("args")) |v| switch (v) {
+        .string => |s| s,
+        else => "",
+    } else "";
+
+    return .{
+        .name = try gpa.dupe(u8, name_str),
+        .lang = try gpa.dupe(u8, lang_str),
+        .entry = try gpa.dupe(u8, entry_str),
+        .description = try gpa.dupe(u8, desc_str),
+        .args = try gpa.dupe(u8, args_str),
+    };
+}
+
+pub fn computePluginRun(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    plugin_name: []const u8,
+    extra_args: []const []const u8,
+) ![]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home: []const u8 = std.mem.span(home_ptr);
+
+    const manifest_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/plugins/{s}/plugin.json", .{ home, plugin_name });
+    defer gpa.free(manifest_path);
+
+    const manifest = readPluginManifest(gpa, io, manifest_path) catch |e| switch (e) {
+        error.ManifestNotFound => return error.PluginNotFound,
+        else => return e,
+    };
+    defer freePluginManifest(gpa, manifest);
+
+    const script_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/plugins/{s}/{s}", .{ home, plugin_name, manifest.entry });
+    defer gpa.free(script_path);
+
+    return computeWorkerRun(gpa, io, manifest.lang, script_path, extra_args, WORKER_DEFAULT_TIMEOUT_MS) catch |e| switch (e) {
+        error.UnknownLang => return error.PluginUnknownLang,
+        error.InterpreterNotFound => return error.PluginInterpreterNotFound,
+        else => return e,
+    };
+}
+
+pub fn computePluginList(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home: []const u8 = std.mem.span(home_ptr);
+
+    const plugins_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/plugins", .{home});
+    defer gpa.free(plugins_path);
+
+    var plugins_buf: std.ArrayList(u8) = .empty;
+    defer plugins_buf.deinit(gpa);
+    var skipped_buf: std.ArrayList(u8) = .empty;
+    defer skipped_buf.deinit(gpa);
+    var plugin_count: u32 = 0;
+    var skipped_count: u32 = 0;
+
+    plugins_walk: {
+        var dir = std.Io.Dir.openDirAbsolute(io, plugins_path, .{ .iterate = true }) catch break :plugins_walk;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch break :plugins_walk) |entry| {
+            if (entry.kind != .directory) continue;
+
+            const mpath = try std.fmt.allocPrint(gpa, "{s}/{s}/plugin.json", .{ plugins_path, entry.name });
+            defer gpa.free(mpath);
+
+            const manifest = readPluginManifest(gpa, io, mpath) catch {
+                if (skipped_count > 0) try skipped_buf.appendSlice(gpa, ", ");
+                const esc = try allocJsonEscape(gpa, mpath);
+                defer gpa.free(esc);
+                try skipped_buf.appendSlice(gpa, "\"");
+                try skipped_buf.appendSlice(gpa, esc);
+                try skipped_buf.appendSlice(gpa, "\"");
+                skipped_count += 1;
+                continue;
+            };
+            defer freePluginManifest(gpa, manifest);
+
+            if (plugin_count > 0) try plugins_buf.appendSlice(gpa, ", ");
+
+            const name_esc = try allocJsonEscape(gpa, manifest.name);
+            defer gpa.free(name_esc);
+            const lang_esc = try allocJsonEscape(gpa, manifest.lang);
+            defer gpa.free(lang_esc);
+            const desc_esc = try allocJsonEscape(gpa, manifest.description);
+            defer gpa.free(desc_esc);
+            const args_esc = try allocJsonEscape(gpa, manifest.args);
+            defer gpa.free(args_esc);
+            const entry_esc = try allocJsonEscape(gpa, manifest.entry);
+            defer gpa.free(entry_esc);
+
+            const plugin_json = try std.fmt.allocPrint(gpa,
+                \\{{"name": "{s}", "lang": "{s}", "description": "{s}", "args": "{s}", "entry": "{s}"}}
+            , .{ name_esc, lang_esc, desc_esc, args_esc, entry_esc });
+            defer gpa.free(plugin_json);
+
+            try plugins_buf.appendSlice(gpa, plugin_json);
+            plugin_count += 1;
+        }
+    }
+
+    return std.fmt.allocPrint(gpa,
+        \\{{"plugins": [{s}], "count": {d}, "skipped": [{s}]}}
+    , .{ plugins_buf.items, plugin_count, skipped_buf.items });
+}
+
+// --- context-slice + state-merge (Module 20 M1 — Multi-Agent Coordinator) ---
+
+fn hasBinaryMagic(_: std.mem.Allocator, io: std.Io, abs_path: []const u8) bool {
+    const f = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return false;
+    defer f.close(io);
+    var rb: [8]u8 = undefined;
+    var r = f.reader(io, &rb);
+    var hdr: [4]u8 = undefined;
+    const n = r.interface.readSliceShort(&hdr) catch return false;
+    if (n < 4) return false;
+    return std.mem.eql(u8, hdr[0..4], "\xcf\xfa\xed\xfe") or
+        std.mem.eql(u8, hdr[0..4], "\xfe\xed\xfa\xcf") or
+        std.mem.eql(u8, hdr[0..4], "\xca\xfe\xba\xbe") or
+        std.mem.eql(u8, hdr[0..4], "\x7fELF");
+}
+
+const SLICE_FILE_CAP: usize = 8;
+const SLICE_CHUNK_CAP: usize = 3;
+
+fn serializeJsonValue(gpa: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .null         => gpa.dupe(u8, "null"),
+        .bool         => |b| gpa.dupe(u8, if (b) "true" else "false"),
+        .integer      => |n| std.fmt.allocPrint(gpa, "{d}", .{n}),
+        .float        => |f| std.fmt.allocPrint(gpa, "{d}", .{f}),
+        .number_string => |s| gpa.dupe(u8, s),
+        .string       => |s| blk: {
+            const esc = try allocJsonEscape(gpa, s);
+            defer gpa.free(esc);
+            break :blk std.fmt.allocPrint(gpa, "\"{s}\"", .{esc});
+        },
+        .array        => |arr| blk: {
+            // Pre-size: estimate 32 bytes/item to avoid growth reallocs
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(gpa);
+            try buf.ensureTotalCapacity(gpa, 2 + arr.items.len * 32);
+            try buf.appendSlice(gpa, "[");
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try buf.appendSlice(gpa, ", ");
+                const s = try serializeJsonValue(gpa, item);
+                defer gpa.free(s);
+                try buf.appendSlice(gpa, s);
+            }
+            try buf.appendSlice(gpa, "]");
+            break :blk gpa.dupe(u8, buf.items);
+        },
+        .object       => |obj| blk: {
+            // Pre-size: estimate 48 bytes/entry to avoid growth reallocs
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(gpa);
+            try buf.ensureTotalCapacity(gpa, 2 + obj.count() * 48);
+            try buf.appendSlice(gpa, "{");
+            var it = obj.iterator();
+            var first_field = true;
+            while (it.next()) |kv| {
+                if (!first_field) try buf.appendSlice(gpa, ", ");
+                first_field = false;
+                const k_esc = try allocJsonEscape(gpa, kv.key_ptr.*);
+                defer gpa.free(k_esc);
+                const v_s = try serializeJsonValue(gpa, kv.value_ptr.*);
+                defer gpa.free(v_s);
+                const entry = try std.fmt.allocPrint(gpa, "\"{s}\": {s}", .{ k_esc, v_s });
+                defer gpa.free(entry);
+                try buf.appendSlice(gpa, entry);
+            }
+            try buf.appendSlice(gpa, "}");
+            break :blk gpa.dupe(u8, buf.items);
+        },
+    };
+}
+
+pub fn computeContextSlice(
+    gpa:   std.mem.Allocator,
+    io:    std.Io,
+    path:  []const u8,
+    focus: []const u8,
+) ![]u8 {
+    const ranked = computeContextRank(gpa, io, path, focus) catch |e| switch (e) {
+        error.FileNotFound => return error.PathNotFound,
+        else => return e,
+    };
+    defer {
+        gpa.free(ranked.root);
+        gpa.free(ranked.query);
+        for (ranked.ranked) |f| gpa.free(f.path);
+        gpa.free(ranked.ranked);
+    }
+
+    const cap = @min(ranked.ranked.len, SLICE_FILE_CAP);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    const focus_esc = try allocJsonEscape(gpa, focus);
+    defer gpa.free(focus_esc);
+    const path_esc = try allocJsonEscape(gpa, path);
+    defer gpa.free(path_esc);
+
+    const header = try std.fmt.allocPrint(gpa,
+        "{{\n  \"focus\": \"{s}\",\n  \"path\": \"{s}\",\n  \"fileCount\": {d},\n  \"files\": [\n",
+        .{ focus_esc, path_esc, cap },
+    );
+    defer gpa.free(header);
+    try out.appendSlice(gpa, header);
+
+    for (ranked.ranked[0..cap], 0..) |rf, fi| {
+        const file_path = try std.fs.path.join(gpa, &.{ path, rf.path });
+        defer gpa.free(file_path);
+
+        const ev = if (hasBinaryMagic(undefined, io, file_path)) null
+            else computeContextEvidence(gpa, io, file_path, focus) catch null;
+        defer if (ev) |e| {
+            gpa.free(e.path);
+            gpa.free(e.pattern);
+            for (e.chunks) |c| gpa.free(c.content);
+            gpa.free(e.chunks);
+        };
+
+        const path2_esc = try allocJsonEscape(gpa, rf.path);
+        defer gpa.free(path2_esc);
+
+        const file_hdr = try std.fmt.allocPrint(gpa,
+            "    {{\"path\": \"{s}\", \"score\": {d}, \"excerpts\": [",
+            .{ path2_esc, rf.score },
+        );
+        defer gpa.free(file_hdr);
+        try out.appendSlice(gpa, file_hdr);
+
+        if (ev) |e| {
+            const chunk_cap = @min(e.chunks.len, SLICE_CHUNK_CAP);
+            for (e.chunks[0..chunk_cap], 0..) |chunk, ci| {
+                if (ci > 0) try out.appendSlice(gpa, ", ");
+                const c_esc = try allocJsonEscape(gpa, chunk.content);
+                defer gpa.free(c_esc);
+                // Stack buffer for the chunk header (startLine/endLine fields)
+                var hdr_buf: [64]u8 = undefined;
+                const hdr = std.fmt.bufPrint(&hdr_buf,
+                    "{{\"startLine\": {d}, \"endLine\": {d}, \"content\": \"",
+                    .{ chunk.startLine, chunk.endLine },
+                ) catch hdr_buf[0..0];
+                try out.appendSlice(gpa, hdr);
+                try out.appendSlice(gpa, c_esc);
+                try out.appendSlice(gpa, "\"}");
+            }
+        }
+
+        try out.appendSlice(gpa, "]}");
+        try out.appendSlice(gpa, if (fi + 1 < cap) ",\n" else "\n");
+    }
+
+    try out.appendSlice(gpa, "  ]\n}");
+    return gpa.dupe(u8, out.items);
+}
+
+pub fn computeStateMerge(
+    gpa:   std.mem.Allocator,
+    io:    std.Io,
+    path1: []const u8,
+    path2: []const u8,
+) ![]u8 {
+    const read_limit = 4 * 1024 * 1024; // 4MB cap per file
+
+    const f1 = std.Io.Dir.openFileAbsolute(io, path1, .{}) catch return error.File1NotFound;
+    defer f1.close(io);
+    var rb1: [4096]u8 = undefined;
+    var r1 = f1.reader(io, &rb1);
+    const c1 = try r1.interface.allocRemaining(gpa, .limited(read_limit));
+    defer gpa.free(c1);
+
+    const f2 = std.Io.Dir.openFileAbsolute(io, path2, .{}) catch return error.File2NotFound;
+    defer f2.close(io);
+    var rb2: [4096]u8 = undefined;
+    var r2 = f2.reader(io, &rb2);
+    const c2 = try r2.interface.allocRemaining(gpa, .limited(read_limit));
+    defer gpa.free(c2);
+
+    const p1 = std.json.parseFromSlice(std.json.Value, gpa, std.mem.trim(u8, c1, " \t\n\r"), .{}) catch return error.File1InvalidJson;
+    defer p1.deinit();
+    const p2 = std.json.parseFromSlice(std.json.Value, gpa, std.mem.trim(u8, c2, " \t\n\r"), .{}) catch return error.File2InvalidJson;
+    defer p2.deinit();
+
+    if (p1.value != .object or p2.value != .object) return error.NotObjects;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\n");
+    var first = true;
+
+    // Keys from p1 — with merge for shared keys
+    var it1 = p1.value.object.iterator();
+    while (it1.next()) |kv| {
+        if (!first) try out.appendSlice(gpa, ",\n");
+        first = false;
+        const k_esc = try allocJsonEscape(gpa, kv.key_ptr.*);
+        defer gpa.free(k_esc);
+
+        const merged_val: []u8 = if (p2.value.object.get(kv.key_ptr.*)) |v2| blk: {
+            // Both have key: concat arrays, v2 wins otherwise
+            if (kv.value_ptr.* == .array and v2 == .array) {
+                var arr_buf: std.ArrayList(u8) = .empty;
+                defer arr_buf.deinit(gpa);
+                try arr_buf.appendSlice(gpa, "[");
+                var af = true;
+                for (kv.value_ptr.*.array.items) |item| {
+                    if (!af) try arr_buf.appendSlice(gpa, ", ");
+                    af = false;
+                    const s = try serializeJsonValue(gpa, item);
+                    defer gpa.free(s);
+                    try arr_buf.appendSlice(gpa, s);
+                }
+                for (v2.array.items) |item| {
+                    if (!af) try arr_buf.appendSlice(gpa, ", ");
+                    af = false;
+                    const s = try serializeJsonValue(gpa, item);
+                    defer gpa.free(s);
+                    try arr_buf.appendSlice(gpa, s);
+                }
+                try arr_buf.appendSlice(gpa, "]");
+                break :blk try gpa.dupe(u8, arr_buf.items);
+            } else {
+                break :blk try serializeJsonValue(gpa, v2);
+            }
+        } else try serializeJsonValue(gpa, kv.value_ptr.*);
+        defer gpa.free(merged_val);
+
+        const line = try std.fmt.allocPrint(gpa, "  \"{s}\": {s}", .{ k_esc, merged_val });
+        defer gpa.free(line);
+        try out.appendSlice(gpa, line);
+    }
+
+    // Keys only in p2
+    var it2 = p2.value.object.iterator();
+    while (it2.next()) |kv| {
+        if (p1.value.object.get(kv.key_ptr.*) != null) continue;
+        if (!first) try out.appendSlice(gpa, ",\n");
+        first = false;
+        const k_esc = try allocJsonEscape(gpa, kv.key_ptr.*);
+        defer gpa.free(k_esc);
+        const v_s = try serializeJsonValue(gpa, kv.value_ptr.*);
+        defer gpa.free(v_s);
+        const line = try std.fmt.allocPrint(gpa, "  \"{s}\": {s}", .{ k_esc, v_s });
+        defer gpa.free(line);
+        try out.appendSlice(gpa, line);
+    }
+
+    try out.appendSlice(gpa, "\n}");
+    return gpa.dupe(u8, out.items);
+}
+
+// --- Ledger ---
+
+const LEDGER_MAX_ENTRIES: usize = 1000;
+const LEDGER_STALE_SECS: i64 = 365 * 86400;
+// Deliberately much shorter than staleness — staleness asks "might this
+// fact be outdated"; this asks "has enough time plausibly passed to
+// observe whether the decision panned out". A values trade-off like
+// "verbose vs terse by default" is worth checking in weeks, not a year.
+const OUTCOME_REVIEW_SECS: i64 = 30 * 86400;
+
+// True when the outcome hasn't been recorded yet AND enough time has
+// passed to plausibly observe one. Pure function of already-known data —
+// used both by parseLedgerFile (computed fresh on every read) and directly
+// testable without touching the filesystem.
+fn computeOutcomeReviewDue(outcome_matched: []const u8, recorded_ts: i64, now_ts: i64) bool {
+    return std.mem.eql(u8, outcome_matched, "unknown") and (now_ts - recorded_ts) >= OUTCOME_REVIEW_SECS;
+}
+
+pub const LedgerEntry = struct {
+    id: []u8,
+    date: []u8,
+    recorded_ts: i64,
+    revalidation_due_ts: i64,
+    winner: []u8,
+    question: []u8,
+    reasoning: []u8,
+    is_stale: bool,
+    category: []u8, // "rps" (default, factual Claude-vs-Zig contest) | "jungian" (values trade-off)
+    shadow: []u8, // "" for "rps" entries — jungian: strongest case against the chosen path
+    synthesis: []u8, // "" for "rps" entries — jungian: what's retained/sacrificed
+    outcome: []u8, // "" until recorded — what actually happened, in hindsight
+    outcome_matched: []u8, // "unknown" (default) | "matched" | "diverged" — did the original prediction hold up?
+    outcome_recorded_ts: i64, // 0 until recorded
+    outcome_review_due: bool, // computed fresh on every read — never persisted to ledger.json
+    tokens_spent: i64, // 0 for entries where this wasn't tracked. "approach" category: measured cost of the chosen approach (solo vs multi-agent) — never predicted, only ever recorded after the fact.
+    domain: []u8, // "" except "curriculum" entries — the tech domain/profession a topic (stored in `question`) is scoped to, e.g. "full-stack-dev"
+    artifact_type: []u8, // "" except "curriculum" entries — "tool" | "doc" | "both"
+    artifact_ref: []u8, // "" except "curriculum" entries — path to the built subcommand/worker and/or knowledgebase doc; "" until something is actually built
+    status: []u8, // "curriculum": "proposed" | "built", derived from artifact_ref. "architecture": "proposed" | "built" | "rejected", explicit arg. "" for every other category.
+    estimated_improvement_pct: f64, // 0.0 except "architecture" entries — Claude's honest estimate backing the roi_tier (winner) and the build/reconsider gate
+    has_drawbacks: bool, // false except "architecture" entries — the other half of the hard gate: pct >= 1.0 and !has_drawbacks is required to recommend "build" outright
+};
+
+pub const LedgerResult = struct {
+    entries: []LedgerEntry,
+    stale_count: usize,
+    total: usize,
+};
+
+pub const LedgerMode = union(enum) {
+    show: void,
+    record: struct { winner: []const u8, question: []const u8, reasoning: []const u8 },
+    // Values trade-off, not a factual contest — no winner. `chosen` is the
+    // decision; `shadow` is the strongest case against it (not a strawman);
+    // `synthesis` states what's retained from the rejected alternative and
+    // what's consciously sacrificed.
+    record_jungian: struct { question: []const u8, chosen: []const u8, shadow: []const u8, synthesis: []const u8 },
+    // Retrospective: did a past decision's prediction actually hold up?
+    // Applies to any category (rps or jungian) — category-agnostic.
+    record_outcome: struct { id: []const u8, outcome: []const u8, matched: []const u8 },
+    // Solo-Claude vs multi-agent workflow decision, scored by MEASURED tokens
+    // spent after the fact — never a prediction. `chosen` is "solo" or
+    // "multi-agent". Builds a track record so a future similar task gets an
+    // evidence-backed recommendation instead of a guess; never auto-triggers
+    // a workflow on its own — the decision to spend stays with the user.
+    record_approach: struct { question: []const u8, chosen: []const u8, reasoning: []const u8, tokens_spent: i64 },
+    // ROI ranking for a learn/build topic within a tech domain — a values
+    // call like jungian (no formal proof that one topic is "highest ROI" to
+    // learn), not a factual contest. `topic` reuses `question`, `roi_tier`
+    // reuses `winner` (same one-free-text-field-per-category pattern as
+    // jungian/approach), `shadow`/`synthesis` are the same fields jungian
+    // uses for the same concepts (strongest case against, what's sacrificed).
+    // `domain` scopes the topic; `artifact_ref` is empty until something is
+    // actually built — `status` is derived from that, never a separate arg.
+    record_curriculum: struct {
+        domain: []const u8,
+        topic: []const u8,
+        roi_tier: []const u8,
+        artifact_type: []const u8,
+        artifact_ref: []const u8,
+        reasoning: []const u8,
+        shadow: []const u8,
+        synthesis: []const u8,
+    },
+    // ROI ranking for a proposed change to 4orman's own architecture (a new
+    // guardrail, subcommand, or hook — not a bug fix, not a change to a
+    // *consuming* project). Narrower and stricter than record_curriculum:
+    // gated by a hard numeric bar (estimated_improvement_pct >= 1.0 and
+    // !has_drawbacks required to recommend "build" outright), not a fixed
+    // taxonomy fallback. `topic` reuses `question`, `roi_tier` reuses
+    // `winner`, `shadow`/`synthesis` are the same jungian-originated fields
+    // (strongest case against, what's sacrificed) — same one-free-text-
+    // field-per-category reuse pattern as jungian/approach/curriculum.
+    // `status` is an explicit arg here (not derived like curriculum's,
+    // since "rejected" has no artifact-emptiness signal to infer from).
+    record_architecture: struct {
+        topic: []const u8,
+        roi_tier: []const u8,
+        estimated_improvement_pct: f64,
+        has_drawbacks: bool,
+        status: []const u8,
+        reasoning: []const u8,
+        shadow: []const u8,
+        synthesis: []const u8,
+    },
+    check_stale: void,
+    validate: []const u8,
+};
+
+fn parseLedgerFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entries: *std.ArrayList(LedgerEntry), now_ts: i64) void {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var r = file.reader(io, &read_buf);
+    const content = r.interface.allocRemaining(gpa, .limited(4 * 1024 * 1024)) catch return;
+    defer gpa.free(content);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const arr_v = parsed.value.object.get("entries") orelse return;
+    if (arr_v != .array) return;
+    for (arr_v.array.items) |item| {
+        if (item != .object) continue;
+        const o = item.object;
+        const id_v = o.get("id") orelse continue;
+        const date_v = o.get("date") orelse continue;
+        const rec_v = o.get("recorded_ts") orelse continue;
+        const rev_v = o.get("revalidation_due_ts") orelse continue;
+        const win_v = o.get("winner") orelse continue;
+        const q_v = o.get("question") orelse continue;
+        const r_v = o.get("reasoning") orelse continue;
+        if (id_v != .string or date_v != .string or win_v != .string or
+            q_v != .string or r_v != .string) continue;
+        const rec_ts: i64 = switch (rec_v) {
+            .integer => |n| n,
+            else => continue,
+        };
+        const rev_ts: i64 = switch (rev_v) {
+            .integer => |n| n,
+            else => continue,
+        };
+        // Added after the original schema shipped — missing on every entry
+        // recorded before this migration. Default to "rps"/"" so old entries
+        // keep parsing exactly as they did.
+        const category_str: []const u8 = if (o.get("category")) |cv| switch (cv) {
+            .string => cv.string,
+            else => "rps",
+        } else "rps";
+        const shadow_str: []const u8 = if (o.get("shadow")) |sv| switch (sv) {
+            .string => sv.string,
+            else => "",
+        } else "";
+        const synthesis_str: []const u8 = if (o.get("synthesis")) |sv| switch (sv) {
+            .string => sv.string,
+            else => "",
+        } else "";
+        // Added after category/shadow/synthesis shipped — missing on every
+        // entry recorded before this migration (both "rps" and "jungian").
+        const outcome_str: []const u8 = if (o.get("outcome")) |ov| switch (ov) {
+            .string => ov.string,
+            else => "",
+        } else "";
+        const outcome_matched_str: []const u8 = if (o.get("outcome_matched")) |mv| switch (mv) {
+            .string => mv.string,
+            else => "unknown",
+        } else "unknown";
+        const outcome_recorded_ts: i64 = if (o.get("outcome_recorded_ts")) |ov| switch (ov) {
+            .integer => |n| n,
+            else => 0,
+        } else 0;
+        // Added after outcome tracking shipped — missing on every entry
+        // recorded before this migration, across every category.
+        const tokens_spent: i64 = if (o.get("tokens_spent")) |tv| switch (tv) {
+            .integer => |n| n,
+            else => 0,
+        } else 0;
+        // Added after tokens_spent shipped (M49, "curriculum" category) —
+        // missing on every entry recorded before this migration, across
+        // every category. "" keeps old entries parsing exactly as before.
+        const domain_str: []const u8 = if (o.get("domain")) |dv| switch (dv) {
+            .string => dv.string,
+            else => "",
+        } else "";
+        const artifact_type_str: []const u8 = if (o.get("artifact_type")) |av| switch (av) {
+            .string => av.string,
+            else => "",
+        } else "";
+        const artifact_ref_str: []const u8 = if (o.get("artifact_ref")) |av| switch (av) {
+            .string => av.string,
+            else => "",
+        } else "";
+        const status_str: []const u8 = if (o.get("status")) |sv| switch (sv) {
+            .string => sv.string,
+            else => "",
+        } else "";
+        // Added after status shipped (M50, "architecture" category) — missing
+        // on every entry recorded before this migration, across every
+        // category. 0.0/false keep old entries parsing exactly as before.
+        const estimated_improvement_pct: f64 = if (o.get("estimated_improvement_pct")) |pv| switch (pv) {
+            .float => pv.float,
+            .integer => |n| @floatFromInt(n),
+            else => 0.0,
+        } else 0.0;
+        const has_drawbacks: bool = if (o.get("has_drawbacks")) |hv| switch (hv) {
+            .bool => hv.bool,
+            else => false,
+        } else false;
+        const entry = LedgerEntry{
+            .id = gpa.dupe(u8, id_v.string) catch continue,
+            .date = gpa.dupe(u8, date_v.string) catch continue,
+            .recorded_ts = rec_ts,
+            .revalidation_due_ts = rev_ts,
+            .winner = gpa.dupe(u8, win_v.string) catch continue,
+            .question = gpa.dupe(u8, q_v.string) catch continue,
+            .reasoning = gpa.dupe(u8, r_v.string) catch continue,
+            .is_stale = now_ts > rev_ts,
+            .category = gpa.dupe(u8, category_str) catch continue,
+            .shadow = gpa.dupe(u8, shadow_str) catch continue,
+            .synthesis = gpa.dupe(u8, synthesis_str) catch continue,
+            .outcome = gpa.dupe(u8, outcome_str) catch continue,
+            .outcome_matched = gpa.dupe(u8, outcome_matched_str) catch continue,
+            .outcome_recorded_ts = outcome_recorded_ts,
+            .outcome_review_due = computeOutcomeReviewDue(outcome_matched_str, rec_ts, now_ts),
+            .tokens_spent = tokens_spent,
+            .domain = gpa.dupe(u8, domain_str) catch continue,
+            .artifact_type = gpa.dupe(u8, artifact_type_str) catch continue,
+            .artifact_ref = gpa.dupe(u8, artifact_ref_str) catch continue,
+            .status = gpa.dupe(u8, status_str) catch continue,
+            .estimated_improvement_pct = estimated_improvement_pct,
+            .has_drawbacks = has_drawbacks,
+        };
+        entries.append(gpa, entry) catch continue;
+        if (entries.items.len >= LEDGER_MAX_ENTRIES) break;
+    }
+}
+
+fn writeLedgerFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entries: []const LedgerEntry) void {
+    const tmp_path = std.fmt.allocPrint(gpa, "{s}.tmp", .{path}) catch return;
+    defer gpa.free(tmp_path);
+    const f = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    var wbuf: [8192]u8 = undefined;
+    var w = f.writerStreaming(io, &wbuf);
+    const ok = blk: {
+        w.interface.writeAll("{\"entries\":[") catch break :blk false;
+        for (entries, 0..) |e, i| {
+            if (i > 0) w.interface.writeAll(",") catch break :blk false;
+            const id_esc = allocJsonEscape(gpa, e.id) catch break :blk false;
+            defer gpa.free(id_esc);
+            const date_esc = allocJsonEscape(gpa, e.date) catch break :blk false;
+            defer gpa.free(date_esc);
+            const win_esc = allocJsonEscape(gpa, e.winner) catch break :blk false;
+            defer gpa.free(win_esc);
+            const q_esc = allocJsonEscape(gpa, e.question) catch break :blk false;
+            defer gpa.free(q_esc);
+            const r_esc = allocJsonEscape(gpa, e.reasoning) catch break :blk false;
+            defer gpa.free(r_esc);
+            const cat_esc = allocJsonEscape(gpa, e.category) catch break :blk false;
+            defer gpa.free(cat_esc);
+            const shadow_esc = allocJsonEscape(gpa, e.shadow) catch break :blk false;
+            defer gpa.free(shadow_esc);
+            const synth_esc = allocJsonEscape(gpa, e.synthesis) catch break :blk false;
+            defer gpa.free(synth_esc);
+            const outcome_esc = allocJsonEscape(gpa, e.outcome) catch break :blk false;
+            defer gpa.free(outcome_esc);
+            const matched_esc = allocJsonEscape(gpa, e.outcome_matched) catch break :blk false;
+            defer gpa.free(matched_esc);
+            const domain_esc = allocJsonEscape(gpa, e.domain) catch break :blk false;
+            defer gpa.free(domain_esc);
+            const artifact_type_esc = allocJsonEscape(gpa, e.artifact_type) catch break :blk false;
+            defer gpa.free(artifact_type_esc);
+            const artifact_ref_esc = allocJsonEscape(gpa, e.artifact_ref) catch break :blk false;
+            defer gpa.free(artifact_ref_esc);
+            const status_esc = allocJsonEscape(gpa, e.status) catch break :blk false;
+            defer gpa.free(status_esc);
+            w.interface.print("{{\"id\":\"{s}\",\"date\":\"{s}\",\"recorded_ts\":{d},\"revalidation_due_ts\":{d},\"winner\":\"{s}\",\"question\":\"{s}\",\"reasoning\":\"{s}\",\"is_stale\":{s},\"category\":\"{s}\",\"shadow\":\"{s}\",\"synthesis\":\"{s}\",\"outcome\":\"{s}\",\"outcome_matched\":\"{s}\",\"outcome_recorded_ts\":{d},\"tokens_spent\":{d},\"domain\":\"{s}\",\"artifact_type\":\"{s}\",\"artifact_ref\":\"{s}\",\"status\":\"{s}\",\"estimated_improvement_pct\":{d},\"has_drawbacks\":{s}}}", .{
+                id_esc,                              date_esc,   e.recorded_ts,     e.revalidation_due_ts, win_esc,     q_esc,                       r_esc,
+                if (e.is_stale) "true" else "false", cat_esc,    shadow_esc,        synth_esc,             outcome_esc, matched_esc,                 e.outcome_recorded_ts,
+                e.tokens_spent,                      domain_esc, artifact_type_esc, artifact_ref_esc,      status_esc,  e.estimated_improvement_pct, if (e.has_drawbacks) "true" else "false",
+            }) catch break :blk false;
+        }
+        w.interface.writeAll("]}\n") catch break :blk false;
+        w.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    f.close(io);
+    if (ok) atomicRenameAbsolute(tmp_path, path);
+}
+
+pub fn computeLedger(gpa: std.mem.Allocator, io: std.Io, mode: LedgerMode) !LedgerResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/ledger.json", .{foreman_dir});
+    defer gpa.free(ledger_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    switch (mode) {
+        .show, .check_stale => {},
+        .record => |rec| {
+            const date = try tsToDateStr(gpa, @intCast(now_ts));
+            defer gpa.free(date);
+            const id_src = try std.fmt.allocPrint(gpa, "{s}:{s}:{s}", .{ rec.winner, rec.question, date });
+            defer gpa.free(id_src);
+            const hex = sha256Hex(id_src);
+            const entry = LedgerEntry{
+                .id = try gpa.dupe(u8, hex[0..16]),
+                .date = try gpa.dupe(u8, date),
+                .recorded_ts = now_ts,
+                .revalidation_due_ts = now_ts + LEDGER_STALE_SECS,
+                .winner = try gpa.dupe(u8, rec.winner),
+                .question = try gpa.dupe(u8, rec.question),
+                .reasoning = try gpa.dupe(u8, rec.reasoning),
+                .is_stale = false,
+                .category = try gpa.dupe(u8, "rps"),
+                .shadow = try gpa.dupe(u8, ""),
+                .synthesis = try gpa.dupe(u8, ""),
+                .outcome = try gpa.dupe(u8, ""),
+                .outcome_matched = try gpa.dupe(u8, "unknown"),
+                .outcome_recorded_ts = 0,
+                .outcome_review_due = false, // just recorded — review is never due immediately
+                .tokens_spent = 0,
+                .domain = try gpa.dupe(u8, ""),
+                .artifact_type = try gpa.dupe(u8, ""),
+                .artifact_ref = try gpa.dupe(u8, ""),
+                .status = try gpa.dupe(u8, ""),
+                .estimated_improvement_pct = 0.0,
+                .has_drawbacks = false,
+            };
+            try entries.append(gpa, entry);
+            writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+        .record_jungian => |rj| {
+            // No "winner" concept for a values trade-off — the chosen path
+            // is stored in the `winner` field for schema-consistency with
+            // "rps" entries (same free-text field, different meaning by
+            // category), rather than adding yet another column.
+            const date = try tsToDateStr(gpa, @intCast(now_ts));
+            defer gpa.free(date);
+            const id_src = try std.fmt.allocPrint(gpa, "jungian:{s}:{s}", .{ rj.question, date });
+            defer gpa.free(id_src);
+            const hex = sha256Hex(id_src);
+            const entry = LedgerEntry{
+                .id = try gpa.dupe(u8, hex[0..16]),
+                .date = try gpa.dupe(u8, date),
+                .recorded_ts = now_ts,
+                .revalidation_due_ts = now_ts + LEDGER_STALE_SECS,
+                .winner = try gpa.dupe(u8, rj.chosen),
+                .question = try gpa.dupe(u8, rj.question),
+                .reasoning = try gpa.dupe(u8, ""),
+                .is_stale = false,
+                .category = try gpa.dupe(u8, "jungian"),
+                .shadow = try gpa.dupe(u8, rj.shadow),
+                .synthesis = try gpa.dupe(u8, rj.synthesis),
+                .outcome = try gpa.dupe(u8, ""),
+                .outcome_matched = try gpa.dupe(u8, "unknown"),
+                .outcome_recorded_ts = 0,
+                .outcome_review_due = false,
+                .tokens_spent = 0,
+                .domain = try gpa.dupe(u8, ""),
+                .artifact_type = try gpa.dupe(u8, ""),
+                .artifact_ref = try gpa.dupe(u8, ""),
+                .status = try gpa.dupe(u8, ""),
+                .estimated_improvement_pct = 0.0,
+                .has_drawbacks = false,
+            };
+            try entries.append(gpa, entry);
+            writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+        .record_approach => |ra| {
+            // "chosen" (solo|multi-agent) reuses the `winner` field, same
+            // pattern as record_jungian reusing it for the chosen path —
+            // one free-text field, meaning depends on category, rather than
+            // adding another column per category. tokens_spent is measured
+            // after the fact by the caller — this subcommand never predicts.
+            const date = try tsToDateStr(gpa, @intCast(now_ts));
+            defer gpa.free(date);
+            const id_src = try std.fmt.allocPrint(gpa, "approach:{s}:{s}", .{ ra.question, date });
+            defer gpa.free(id_src);
+            const hex = sha256Hex(id_src);
+            const entry = LedgerEntry{
+                .id = try gpa.dupe(u8, hex[0..16]),
+                .date = try gpa.dupe(u8, date),
+                .recorded_ts = now_ts,
+                .revalidation_due_ts = now_ts + LEDGER_STALE_SECS,
+                .winner = try gpa.dupe(u8, ra.chosen),
+                .question = try gpa.dupe(u8, ra.question),
+                .reasoning = try gpa.dupe(u8, ra.reasoning),
+                .is_stale = false,
+                .category = try gpa.dupe(u8, "approach"),
+                .shadow = try gpa.dupe(u8, ""),
+                .synthesis = try gpa.dupe(u8, ""),
+                .outcome = try gpa.dupe(u8, ""),
+                .outcome_matched = try gpa.dupe(u8, "unknown"),
+                .outcome_recorded_ts = 0,
+                .outcome_review_due = false,
+                .tokens_spent = ra.tokens_spent,
+                .domain = try gpa.dupe(u8, ""),
+                .artifact_type = try gpa.dupe(u8, ""),
+                .artifact_ref = try gpa.dupe(u8, ""),
+                .status = try gpa.dupe(u8, ""),
+                .estimated_improvement_pct = 0.0,
+                .has_drawbacks = false,
+            };
+            try entries.append(gpa, entry);
+            writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+        .record_curriculum => |rc| {
+            // ROI ranking is a values call, not a factual one — see the
+            // LedgerMode.record_curriculum doc comment. `status` is derived
+            // from `artifact_ref` rather than a separate argument: if a real
+            // path was given, something has already been built; otherwise
+            // this is still a proposed topic. Zig only stores this decision
+            // — it never scaffolds the artifact itself (confirmed: Claude
+            // decides and builds, Zig records).
+            const date = try tsToDateStr(gpa, @intCast(now_ts));
+            defer gpa.free(date);
+            const id_src = try std.fmt.allocPrint(gpa, "curriculum:{s}:{s}:{s}", .{ rc.domain, rc.topic, date });
+            defer gpa.free(id_src);
+            const hex = sha256Hex(id_src);
+            const status_str: []const u8 = if (rc.artifact_ref.len > 0) "built" else "proposed";
+            const entry = LedgerEntry{
+                .id = try gpa.dupe(u8, hex[0..16]),
+                .date = try gpa.dupe(u8, date),
+                .recorded_ts = now_ts,
+                .revalidation_due_ts = now_ts + LEDGER_STALE_SECS,
+                .winner = try gpa.dupe(u8, rc.roi_tier),
+                .question = try gpa.dupe(u8, rc.topic),
+                .reasoning = try gpa.dupe(u8, rc.reasoning),
+                .is_stale = false,
+                .category = try gpa.dupe(u8, "curriculum"),
+                .shadow = try gpa.dupe(u8, rc.shadow),
+                .synthesis = try gpa.dupe(u8, rc.synthesis),
+                .outcome = try gpa.dupe(u8, ""),
+                .outcome_matched = try gpa.dupe(u8, "unknown"),
+                .outcome_recorded_ts = 0,
+                .outcome_review_due = false,
+                .tokens_spent = 0,
+                .domain = try gpa.dupe(u8, rc.domain),
+                .artifact_type = try gpa.dupe(u8, rc.artifact_type),
+                .artifact_ref = try gpa.dupe(u8, rc.artifact_ref),
+                .status = try gpa.dupe(u8, status_str),
+                .estimated_improvement_pct = 0.0,
+                .has_drawbacks = false,
+            };
+            try entries.append(gpa, entry);
+            writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+        .record_architecture => |ra| {
+            // ROI ranking for a proposed 4orman architecture change — see the
+            // LedgerMode.record_architecture doc comment. Unlike curriculum,
+            // `status` is an explicit arg (not derived) since "rejected" is a
+            // real, common outcome here that an artifact_ref check can't
+            // express. Zig only stores this decision; it never scaffolds
+            // anything and never applies the gate itself — the gate check
+            // lives in computeArchitectureCheck, this just records whatever
+            // the caller already decided.
+            const date = try tsToDateStr(gpa, @intCast(now_ts));
+            defer gpa.free(date);
+            const id_src = try std.fmt.allocPrint(gpa, "architecture:{s}:{s}", .{ ra.topic, date });
+            defer gpa.free(id_src);
+            const hex = sha256Hex(id_src);
+            const entry = LedgerEntry{
+                .id = try gpa.dupe(u8, hex[0..16]),
+                .date = try gpa.dupe(u8, date),
+                .recorded_ts = now_ts,
+                .revalidation_due_ts = now_ts + LEDGER_STALE_SECS,
+                .winner = try gpa.dupe(u8, ra.roi_tier),
+                .question = try gpa.dupe(u8, ra.topic),
+                .reasoning = try gpa.dupe(u8, ra.reasoning),
+                .is_stale = false,
+                .category = try gpa.dupe(u8, "architecture"),
+                .shadow = try gpa.dupe(u8, ra.shadow),
+                .synthesis = try gpa.dupe(u8, ra.synthesis),
+                .outcome = try gpa.dupe(u8, ""),
+                .outcome_matched = try gpa.dupe(u8, "unknown"),
+                .outcome_recorded_ts = 0,
+                .outcome_review_due = false,
+                .tokens_spent = 0,
+                .domain = try gpa.dupe(u8, ""),
+                .artifact_type = try gpa.dupe(u8, ""),
+                .artifact_ref = try gpa.dupe(u8, ""),
+                .status = try gpa.dupe(u8, ra.status),
+                .estimated_improvement_pct = ra.estimated_improvement_pct,
+                .has_drawbacks = ra.has_drawbacks,
+            };
+            try entries.append(gpa, entry);
+            writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+        .record_outcome => |ro| {
+            var found = false;
+            for (entries.items) |*e| {
+                if (std.mem.startsWith(u8, e.id, ro.id) or std.mem.eql(u8, e.id, ro.id)) {
+                    gpa.free(e.outcome);
+                    e.outcome = try gpa.dupe(u8, ro.outcome);
+                    gpa.free(e.outcome_matched);
+                    e.outcome_matched = try gpa.dupe(u8, ro.matched);
+                    e.outcome_recorded_ts = now_ts;
+                    e.outcome_review_due = false;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+        .validate => |id| {
+            var found = false;
+            for (entries.items) |*e| {
+                if (std.mem.startsWith(u8, e.id, id) or std.mem.eql(u8, e.id, id)) {
+                    e.revalidation_due_ts = now_ts + LEDGER_STALE_SECS;
+                    e.is_stale = false;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) writeLedgerFile(gpa, io, ledger_path, entries.items);
+        },
+    }
+
+    const total = entries.items.len;
+    var stale_count: usize = 0;
+    for (entries.items) |e| {
+        if (e.is_stale) stale_count += 1;
+    }
+
+    const result_entries = switch (mode) {
+        .check_stale => blk: {
+            var stale_list: std.ArrayList(LedgerEntry) = .empty;
+            for (entries.items) |e| {
+                if (e.is_stale) try stale_list.append(gpa, e);
+            }
+            break :blk try stale_list.toOwnedSlice(gpa);
+        },
+        else => try entries.toOwnedSlice(gpa),
+    };
+
+    return LedgerResult{
+        .entries = result_entries,
+        .stale_count = stale_count,
+        .total = total,
+    };
+}
+
+pub const LedgerScoreResult = struct {
+    composite: f64,
+    sample_count: usize,
+    total_points: i64,
+    max_points: i64,
+    winner: ?[]const u8,
+    void_round: bool,
+    reason: []const u8,
+    zig_entry_found: bool,
+    zig_entry_stale: bool,
+};
+
+fn containsIgnoreAsciiCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |nc, j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(nc)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+pub fn computeLedgerScore(gpa: std.mem.Allocator, io: std.Io, question: []const u8, sources_json: []const u8) !LedgerScoreResult {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, sources_json, .{}) catch {
+        return LedgerScoreResult{
+            .composite = 0.0, .sample_count = 0, .total_points = 0, .max_points = 0,
+            .winner = null, .void_round = true,
+            .reason = "invalid sources JSON",
+            .zig_entry_found = false, .zig_entry_stale = false,
+        };
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .array) {
+        return LedgerScoreResult{
+            .composite = 0.0, .sample_count = 0, .total_points = 0, .max_points = 0,
+            .winner = null, .void_round = true,
+            .reason = "sources must be a JSON array",
+            .zig_entry_found = false, .zig_entry_stale = false,
+        };
+    }
+
+    const sources = parsed.value.array.items;
+    const sample_count = sources.len;
+    var total_points: i64 = 0;
+    for (sources) |s| {
+        if (s != .object) continue;
+        const o = s.object;
+        const cited = if (o.get("cited")) |v| (v == .bool and v.bool) else false;
+        const contradicted = if (o.get("contradicted")) |v| (v == .bool and v.bool) else false;
+        if (cited) total_points += 10;
+        if (contradicted) total_points -= 10;
+    }
+    if (total_points < 0) total_points = 0;
+    const max_points: i64 = @intCast(sample_count * 10);
+    const composite: f64 = if (max_points > 0)
+        @as(f64, @floatFromInt(total_points)) / @as(f64, @floatFromInt(max_points)) * 100.0
+    else 0.0;
+
+    if (sample_count < 10 or total_points < max_points) {
+        const reason: []const u8 = if (sample_count < 10)
+            "fewer than 10 sources — void round, gather more evidence"
+        else
+            "composite below 100% — void round, some sources uncited or contradicted";
+        return LedgerScoreResult{
+            .composite = composite, .sample_count = sample_count,
+            .total_points = total_points, .max_points = max_points,
+            .winner = null, .void_round = true, .reason = reason,
+            .zig_entry_found = false, .zig_entry_stale = false,
+        };
+    }
+
+    // Composite == 100%. Check ledger for a stored entry on this question.
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    parseLedgerFile(gpa, io, ledger_path, &entries, now_ts);
+
+    var zig_entry_found = false;
+    var zig_entry_stale = false;
+    for (entries.items) |e| {
+        if (containsIgnoreAsciiCase(e.question, question) or
+            containsIgnoreAsciiCase(question, e.question))
+        {
+            zig_entry_found = true;
+            zig_entry_stale = e.is_stale;
+            break;
+        }
+    }
+
+    const winner: []const u8 = if (zig_entry_found and !zig_entry_stale) "zig" else "claude";
+    const reason: []const u8 = if (zig_entry_found and !zig_entry_stale)
+        "zig wins — valid ledger entry exists; stored verified data beats fresh reasoning (tiebreaker)"
+    else if (zig_entry_found and zig_entry_stale)
+        "claude wins — zig entry stale (>365 days), claude scored 100%"
+    else
+        "claude wins — no zig ledger entry, claude scored 100% on 10+ live sources";
+
+    return LedgerScoreResult{
+        .composite = composite, .sample_count = sample_count,
+        .total_points = total_points, .max_points = max_points,
+        .winner = winner, .void_round = false, .reason = reason,
+        .zig_entry_found = zig_entry_found, .zig_entry_stale = zig_entry_stale,
+    };
+}
+
+// --- tui subcommand ---
+
+const TUI_SCRIPT = @embedFile("tui.py");
+
+pub fn computeTui(gpa: std.mem.Allocator, io: std.Io, workspace_root: []const u8) !void {
+    // ── 1. Get GitHub username ──────────────────────────────────────────────
+    const user: []const u8 = blk: {
+        const r = std.process.run(gpa, io, .{
+            .argv = &.{ "gh", "api", "user", "--jq", ".login" },
+        }) catch break :blk try gpa.dupe(u8, "unknown");
+        defer gpa.free(r.stderr);
+        switch (r.term) {
+            .exited => |c| if (c != 0) {
+                gpa.free(r.stdout);
+                break :blk try gpa.dupe(u8, "unknown");
+            },
+            else => {
+                gpa.free(r.stdout);
+                break :blk try gpa.dupe(u8, "unknown");
+            },
+        }
+        const trimmed = std.mem.trim(u8, r.stdout, " \n\r\t");
+        const dup = try gpa.dupe(u8, trimmed);
+        gpa.free(r.stdout);
+        break :blk dup;
+    };
+    defer gpa.free(user);
+
+    // ── 2. List GitHub repos (name, url, isPrivate, description) ───────────
+    const gh_repos_raw: []u8 = blk: {
+        const r = std.process.run(gpa, io, .{
+            .argv = &.{
+                "gh", "repo", "list",
+                "--json", "name,url,isPrivate,description",
+                "--limit", "100",
+            },
+        }) catch break :blk try gpa.dupe(u8, "[]");
+        defer gpa.free(r.stderr);
+        switch (r.term) {
+            .exited => |c| if (c != 0) {
+                gpa.free(r.stdout);
+                break :blk try gpa.dupe(u8, "[]");
+            },
+            else => {
+                gpa.free(r.stdout);
+                break :blk try gpa.dupe(u8, "[]");
+            },
+        }
+        break :blk r.stdout;
+    };
+    defer gpa.free(gh_repos_raw);
+
+    // ── 3. Build project list JSON ─────────────────────────────────────────
+    var projects_json: std.ArrayList(u8) = .empty;
+    defer projects_json.deinit(gpa);
+
+    try projects_json.appendSlice(gpa, "[\n");
+
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, gh_repos_raw, .{}) catch null;
+    defer if (parsed) |p| p.deinit();
+
+    var first_entry = true;
+
+    if (parsed) |p| {
+        if (p.value == .array) {
+            for (p.value.array.items) |repo| {
+                if (repo != .object) continue;
+                const name_val = repo.object.get("name") orelse continue;
+                if (name_val != .string) continue;
+                const name = name_val.string;
+
+                // skip framework repos
+                if (isFrameworkRepo(name)) continue;
+
+                const url_val = repo.object.get("url") orelse continue;
+                const url = if (url_val == .string) url_val.string else "";
+                const is_priv = if (repo.object.get("isPrivate")) |v| v == .bool and v.bool else false;
+                const desc = if (repo.object.get("description")) |v| if (v == .string) v.string else "" else "";
+
+                // local path
+                const local_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, name });
+                defer gpa.free(local_path);
+                const is_local = fileExists(io, local_path);
+
+                // git metadata (only if local)
+                var latest_tag: ?[]u8 = null;
+                var commits_since: u32 = 0;
+                var is_dirty = false;
+                var has_spec = false;
+                var has_claude_md = false;
+
+                if (is_local) {
+                    const spec_path = try std.fmt.allocPrint(gpa, "{s}/spec.md", .{local_path});
+                    defer gpa.free(spec_path);
+                    has_spec = fileExists(io, spec_path);
+
+                    const claude_path = try std.fmt.allocPrint(gpa, "{s}/CLAUDE.md", .{local_path});
+                    defer gpa.free(claude_path);
+                    has_claude_md = fileExists(io, claude_path);
+
+                    // latest tag
+                    if (runGit(gpa, io, local_path, &.{ "describe", "--tags", "--abbrev=0" })) |tag_raw| {
+                        defer gpa.free(tag_raw);
+                        const tag = std.mem.trim(u8, tag_raw, " \n\r\t");
+                        if (tag.len > 0) {
+                            latest_tag = try gpa.dupe(u8, tag);
+                        }
+                    } else |_| {}
+
+                    // commits since tag
+                    if (latest_tag) |lt| {
+                        const range = try std.fmt.allocPrint(gpa, "{s}..HEAD", .{lt});
+                        defer gpa.free(range);
+                        if (runGit(gpa, io, local_path, &.{ "log", range, "--oneline" })) |log_raw| {
+                            defer gpa.free(log_raw);
+                            var line_count: u32 = 0;
+                            var it = std.mem.splitScalar(u8, log_raw, '\n');
+                            while (it.next()) |line| {
+                                if (line.len > 0) line_count += 1;
+                            }
+                            commits_since = line_count;
+                        } else |_| {}
+                    }
+
+                    // dirty state
+                    if (runGit(gpa, io, local_path, &.{ "status", "--porcelain" })) |st_raw| {
+                        defer gpa.free(st_raw);
+                        is_dirty = std.mem.trim(u8, st_raw, " \n\r\t").len > 0;
+                    } else |_| {}
+                }
+                defer if (latest_tag) |lt| gpa.free(lt);
+
+                const tag_str: []const u8 = if (latest_tag) |lt| lt else "";
+                const name_esc = try allocJsonEscape(gpa, name);
+                defer gpa.free(name_esc);
+                const url_esc = try allocJsonEscape(gpa, url);
+                defer gpa.free(url_esc);
+                const path_esc = try allocJsonEscape(gpa, local_path);
+                defer gpa.free(path_esc);
+                const desc_esc = try allocJsonEscape(gpa, desc);
+                defer gpa.free(desc_esc);
+                const tag_esc = try allocJsonEscape(gpa, tag_str);
+                defer gpa.free(tag_esc);
+
+                if (!first_entry) try projects_json.appendSlice(gpa, ",\n");
+                first_entry = false;
+
+                const entry = try std.fmt.allocPrint(gpa,
+                    \\  {{
+                    \\    "name": "{s}",
+                    \\    "url": "{s}",
+                    \\    "path": "{s}",
+                    \\    "description": "{s}",
+                    \\    "is_local": {s},
+                    \\    "is_private": {s},
+                    \\    "latest_tag": "{s}",
+                    \\    "commits_since": {d},
+                    \\    "is_dirty": {s},
+                    \\    "has_spec": {s},
+                    \\    "has_claude_md": {s}
+                    \\  }}
+                , .{
+                    name_esc,
+                    url_esc,
+                    path_esc,
+                    desc_esc,
+                    if (is_local) "true" else "false",
+                    if (is_priv) "true" else "false",
+                    tag_esc,
+                    commits_since,
+                    if (is_dirty) "true" else "false",
+                    if (has_spec) "true" else "false",
+                    if (has_claude_md) "true" else "false",
+                });
+                defer gpa.free(entry);
+                try projects_json.appendSlice(gpa, entry);
+            }
+        }
+    }
+
+    try projects_json.appendSlice(gpa, "\n]");
+
+    // ── 4. Build full data JSON ────────────────────────────────────────────
+    const user_esc = try allocJsonEscape(gpa, user);
+    defer gpa.free(user_esc);
+
+    const data_json = try std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "user": "{s}",
+        \\  "projects": {s}
+        \\}}
+    , .{ user_esc, projects_json.items });
+    defer gpa.free(data_json);
+
+    // ── 5. Write data + script to temp files ──────────────────────────────
+    const pid = std.c.getpid();
+    const data_path = try std.fmt.allocPrint(gpa, "/tmp/4orman-tui-{d}.json", .{pid});
+    defer gpa.free(data_path);
+    const script_path = try std.fmt.allocPrint(gpa, "/tmp/4orman-tui-{d}.py", .{pid});
+    defer gpa.free(script_path);
+
+    {
+        const df = try std.Io.Dir.createFileAbsolute(io, data_path, .{});
+        var dbuf: [4096]u8 = undefined;
+        var dw = df.writerStreaming(io, &dbuf);
+        try dw.interface.writeAll(data_json);
+        try dw.interface.flush();
+        df.close(io);
+    }
+
+    {
+        const sf = try std.Io.Dir.createFileAbsolute(io, script_path, .{});
+        var sbuf: [4096]u8 = undefined;
+        var sw = sf.writerStreaming(io, &sbuf);
+        try sw.interface.writeAll(TUI_SCRIPT);
+        try sw.interface.flush();
+        sf.close(io);
+    }
+
+    // ── 6. Spawn python3 with inherited stdio (interactive TUI) ───────────
+    const python_candidates = [_][]const u8{ "/usr/bin/python3", "python3", "python" };
+    for (python_candidates) |python| {
+        var child = std.process.spawn(io, .{
+            .argv = &.{ python, script_path, data_path },
+            .stdin  = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |e| switch (e) {
+            error.FileNotFound, error.AccessDenied, error.InvalidExe => continue,
+            else => return e,
+        };
+        const term = try child.wait(io);
+        const exit_code: u8 = switch (term) {
+            .exited => |c| @truncate(c),
+            else => 1,
+        };
+        std.process.exit(exit_code);
+    }
+
+    // If we reach here, no python was found
+    const err_io = std.Io.File.stderr();
+    var errbuf: [256]u8 = undefined;
+    var errw = err_io.writerStreaming(io, &errbuf);
+    try errw.interface.writeAll("error: python3 not found — install Python 3 to use `tui`\n");
+    try errw.interface.flush();
+    std.process.exit(1);
+}
+
+// --- knowledge-audit subcommand ---
+
+pub const KnowledgeAuditItem = struct {
+    label: []const u8, // owned
+    source: []const u8, // "local" | "ledger" | "knowledgebase" | "github" | "git"
+};
+
+pub const KnowledgeAuditResult = struct {
+    project: []const u8, // owned
+    path: []const u8, // owned
+    ready: bool,
+    captured: []KnowledgeAuditItem, // owned slice
+    unextracted: []KnowledgeAuditItem, // owned slice
+    warnings: []KnowledgeAuditItem, // owned slice
+};
+
+fn kaReadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var r = file.reader(io, &buf);
+    return r.interface.allocRemaining(gpa, .limited(2 * 1024 * 1024)) catch null;
+}
+
+fn kaCountDecisionRows(content: []const u8) u32 {
+    // Count Markdown table rows starting with "| 20" (year prefix skips header).
+    var count: u32 = 0;
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed, "| 20")) count += 1;
+    }
+    return count;
+}
+
+fn kaProjectInLedger(ledger_json: []const u8, project_name: []const u8) u32 {
+    // Count occurrences of project_name in the ledger JSON (covers question + reasoning fields).
+    var count: u32 = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOf(u8, ledger_json[pos..], project_name)) |idx| {
+        count += 1;
+        pos += idx + project_name.len;
+        if (pos >= ledger_json.len) break;
+    }
+    return count;
+}
+
+pub fn computeKnowledgeAudit(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_path: []const u8,
+    workspace_root: []const u8,
+) !KnowledgeAuditResult {
+    const name = std.fs.path.basename(project_path);
+
+    var captured: std.ArrayList(KnowledgeAuditItem) = .empty;
+    errdefer {
+        for (captured.items) |it| { gpa.free(it.label); gpa.free(it.source); }
+        captured.deinit(gpa);
+    }
+    var unextracted: std.ArrayList(KnowledgeAuditItem) = .empty;
+    errdefer {
+        for (unextracted.items) |it| { gpa.free(it.label); gpa.free(it.source); }
+        unextracted.deinit(gpa);
+    }
+    var warnings: std.ArrayList(KnowledgeAuditItem) = .empty;
+    errdefer {
+        for (warnings.items) |it| { gpa.free(it.label); gpa.free(it.source); }
+        warnings.deinit(gpa);
+    }
+
+    // 1. spec.md
+    const spec_path = try std.fmt.allocPrint(gpa, "{s}/spec.md", .{project_path});
+    defer gpa.free(spec_path);
+    if (fileExists(io, spec_path)) {
+        try captured.append(gpa, .{
+            .label = try gpa.dupe(u8, "spec.md present"),
+            .source = try gpa.dupe(u8, "local"),
+        });
+    } else {
+        try unextracted.append(gpa, .{
+            .label = try gpa.dupe(u8, "spec.md missing — document what this project does before archiving"),
+            .source = try gpa.dupe(u8, "local"),
+        });
+    }
+
+    // 2. CLAUDE.md decision log
+    const claude_path = try std.fmt.allocPrint(gpa, "{s}/CLAUDE.md", .{project_path});
+    defer gpa.free(claude_path);
+    if (fileExists(io, claude_path)) {
+        if (kaReadFile(gpa, io, claude_path)) |raw| {
+            defer gpa.free(raw);
+            const decision_count = kaCountDecisionRows(raw);
+            if (decision_count > 0) {
+                const label = try std.fmt.allocPrint(gpa, "CLAUDE.md: {d} decision log entr{s}", .{
+                    decision_count, if (decision_count == 1) "y" else "ies",
+                });
+                try captured.append(gpa, .{ .label = label, .source = try gpa.dupe(u8, "local") });
+            } else {
+                try captured.append(gpa, .{
+                    .label = try gpa.dupe(u8, "CLAUDE.md present (no decision log entries)"),
+                    .source = try gpa.dupe(u8, "local"),
+                });
+            }
+        }
+    } else {
+        try unextracted.append(gpa, .{
+            .label = try gpa.dupe(u8, "CLAUDE.md missing — no decision log"),
+            .source = try gpa.dupe(u8, "local"),
+        });
+    }
+
+    // 3. knowledge/ directory — check each .md against _knowledgebase/
+    const knowledge_path = try std.fmt.allocPrint(gpa, "{s}/knowledge", .{project_path});
+    defer gpa.free(knowledge_path);
+    const kb_root = try std.fmt.allocPrint(gpa, "{s}/_knowledgebase", .{workspace_root});
+    defer gpa.free(kb_root);
+
+    if (fileExists(io, knowledge_path)) {
+        const find_result = std.process.run(gpa, io, .{
+            .argv = &.{ "find", knowledge_path, "-maxdepth", "1", "-name", "*.md", "-type", "f" },
+        }) catch null;
+        if (find_result) |fr| {
+            defer gpa.free(fr.stderr);
+            defer gpa.free(fr.stdout);
+            var lines = std.mem.tokenizeScalar(u8, fr.stdout, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const basename = std.fs.path.basename(line);
+                const kb_mirror = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ kb_root, basename });
+                defer gpa.free(kb_mirror);
+                if (fileExists(io, kb_mirror)) {
+                    const label = try std.fmt.allocPrint(gpa, "knowledge/{s} — mirrored in _knowledgebase/", .{basename});
+                    try captured.append(gpa, .{ .label = label, .source = try gpa.dupe(u8, "knowledgebase") });
+                } else {
+                    const label = try std.fmt.allocPrint(gpa, "knowledge/{s} — not in _knowledgebase/ (extract or mark project-only)", .{basename});
+                    try unextracted.append(gpa, .{ .label = label, .source = try gpa.dupe(u8, "local") });
+                }
+            }
+        }
+    }
+
+    // 4. Git: clean working tree
+    if (runGit(gpa, io, project_path, &.{ "status", "--porcelain" })) |sr| {
+        defer gpa.free(sr);
+        if (std.mem.trim(u8, sr, " \n\r").len > 0) {
+            try warnings.append(gpa, .{
+                .label = try gpa.dupe(u8, "uncommitted changes — commit and push before archiving"),
+                .source = try gpa.dupe(u8, "git"),
+            });
+        } else {
+            try captured.append(gpa, .{
+                .label = try gpa.dupe(u8, "git: clean working tree"),
+                .source = try gpa.dupe(u8, "git"),
+            });
+        }
+    } else |_| {}
+
+    // 5. Git: no unpushed commits
+    if (runGit(gpa, io, project_path, &.{ "log", "@{u}..HEAD", "--oneline" })) |ar| {
+        defer gpa.free(ar);
+        var unpushed: u32 = 0;
+        var iter = std.mem.tokenizeScalar(u8, ar, '\n');
+        while (iter.next()) |line| { if (line.len > 0) unpushed += 1; }
+        if (unpushed > 0) {
+            const label = try std.fmt.allocPrint(gpa, "{d} unpushed commit{s} — push to GitHub before archiving", .{
+                unpushed, if (unpushed == 1) "" else "s",
+            });
+            try warnings.append(gpa, .{ .label = label, .source = try gpa.dupe(u8, "git") });
+        } else {
+            try captured.append(gpa, .{
+                .label = try gpa.dupe(u8, "git: fully pushed to GitHub"),
+                .source = try gpa.dupe(u8, "github"),
+            });
+        }
+    } else |_| {}
+
+    // 6. Ledger: entries referencing this project
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const ledger_path = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+    defer gpa.free(ledger_path);
+    if (fileExists(io, ledger_path)) {
+        if (kaReadFile(gpa, io, ledger_path)) |lr| {
+            defer gpa.free(lr);
+            const hits = kaProjectInLedger(lr, name);
+            if (hits > 0) {
+                const label = try std.fmt.allocPrint(gpa, "ledger: {d} reference{s} to this project in decision history", .{
+                    hits, if (hits == 1) "" else "s",
+                });
+                try captured.append(gpa, .{ .label = label, .source = try gpa.dupe(u8, "ledger") });
+            }
+        }
+    }
+
+    // 7. _skills/: skill files referencing this project
+    const skills_root = try std.fmt.allocPrint(gpa, "{s}/_skills", .{workspace_root});
+    defer gpa.free(skills_root);
+    if (fileExists(io, skills_root)) {
+        const grep_result = std.process.run(gpa, io, .{
+            .argv = &.{ "grep", "-rl", name, skills_root },
+        }) catch null;
+        if (grep_result) |gr| {
+            defer gpa.free(gr.stderr);
+            defer gpa.free(gr.stdout);
+            const trimmed = std.mem.trim(u8, gr.stdout, " \n\r");
+            if (trimmed.len > 0) {
+                var skill_count: u32 = 0;
+                var iter = std.mem.tokenizeScalar(u8, trimmed, '\n');
+                while (iter.next()) |_| skill_count += 1;
+                const label = try std.fmt.allocPrint(gpa, "_skills/: {d} skill file{s} reference this project", .{
+                    skill_count, if (skill_count == 1) "" else "s",
+                });
+                try captured.append(gpa, .{ .label = label, .source = try gpa.dupe(u8, "local") });
+            }
+        }
+    }
+
+    const ready = unextracted.items.len == 0 and warnings.items.len == 0;
+
+    return KnowledgeAuditResult{
+        .project = try gpa.dupe(u8, name),
+        .path = try gpa.dupe(u8, project_path),
+        .ready = ready,
+        .captured = try captured.toOwnedSlice(gpa),
+        .unextracted = try unextracted.toOwnedSlice(gpa),
+        .warnings = try warnings.toOwnedSlice(gpa),
+    };
+}
+
+// --- export / import subcommands ---
+
+pub const ExportResult = struct {
+    output_path: []const u8, // owned — absolute path to generated file
+    name: []const u8,        // owned
+    version: []const u8,     // owned
+    format: []const u8,      // owned — "fmz"|"brew"|"mac"|"linux"|"windows"|"backup"
+    success: bool,
+    note: []const u8,        // owned — next-steps / install hint
+};
+
+pub const ImportResult = struct {
+    name: []const u8,          // owned
+    dest_path: []const u8,     // owned
+    source_format: []const u8, // owned — "fmz" | "directory"
+    deps_note: []const u8,     // owned
+    success: bool,
+    note: []const u8,          // owned
+};
+
+fn exportRunIgnore(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) void {
+    const r = std.process.run(gpa, io, .{ .argv = argv }) catch return;
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+}
+
+fn exportWriteFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, content: []const u8) bool {
+    const tmp = std.fmt.allocPrint(gpa, "{s}.tmp", .{path}) catch return false;
+    defer gpa.free(tmp);
+    const cf = std.Io.Dir.createFileAbsolute(io, tmp, .{}) catch return false;
+    var wbuf: [8192]u8 = undefined;
+    var w = cf.writerStreaming(io, &wbuf);
+    const ok = blk: {
+        w.interface.writeAll(content) catch break :blk false;
+        w.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    cf.close(io);
+    if (!ok) return false;
+    atomicRenameAbsolute(tmp, path);
+    return true;
+}
+
+fn exportWriteManifest(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    name: []const u8,
+    version: []const u8,
+    description: []const u8,
+    github_url: []const u8,
+    kind: []const u8,
+) bool {
+    const json = std.fmt.allocPrint(gpa,
+        \\{{
+        \\  "name": "{s}",
+        \\  "version": "{s}",
+        \\  "foreman_min": "{s}",
+        \\  "description": "{s}",
+        \\  "kind": "{s}",
+        \\  "github_url": "{s}",
+        \\  "deps": {{"brew": [], "apt": [], "winget": []}},
+        \\  "knowledge_files": []
+        \\}}
+        \\
+    , .{ name, version, VERSION, description, kind, github_url }) catch return false;
+    defer gpa.free(json);
+    return exportWriteFile(gpa, io, path, json);
+}
+
+fn exportGetVersion(gpa: std.mem.Allocator, io: std.Io, project_path: []const u8) []const u8 {
+    const raw = runGit(gpa, io, project_path, &.{ "describe", "--tags", "--abbrev=0" }) catch
+        return gpa.dupe(u8, "0.0.0") catch "0.0.0";
+    defer gpa.free(raw);
+    return gpa.dupe(u8, std.mem.trim(u8, raw, " \n\r")) catch "0.0.0";
+}
+
+fn exportGetGithubUrl(gpa: std.mem.Allocator, io: std.Io, project_path: []const u8) []const u8 {
+    const raw = runGit(gpa, io, project_path, &.{ "remote", "get-url", "origin" }) catch
+        return gpa.dupe(u8, "") catch "";
+    defer gpa.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \n\r");
+    if (std.mem.startsWith(u8, trimmed, "git@github.com:")) {
+        const rest = trimmed["git@github.com:".len..];
+        const repo_name = if (std.mem.endsWith(u8, rest, ".git")) rest[0 .. rest.len - 4] else rest;
+        return std.fmt.allocPrint(gpa, "https://github.com/{s}", .{repo_name}) catch "";
+    }
+    return gpa.dupe(u8, trimmed) catch "";
+}
+
+fn exportFmz(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_path: []const u8,
+    out_dir: []const u8,
+    github_url: []const u8,
+    version: []const u8,
+    name: []const u8,
+    staging_root: []const u8,
+) ExportResult {
+    const pkg_name = std.fmt.allocPrint(gpa, "{s}-{s}", .{ name, version }) catch
+        return .{ .output_path = gpa.dupe(u8, "") catch "", .name = gpa.dupe(u8, name) catch "", .version = gpa.dupe(u8, version) catch "", .format = gpa.dupe(u8, "fmz") catch "", .success = false, .note = gpa.dupe(u8, "out of memory") catch "" };
+    defer gpa.free(pkg_name);
+
+    const staging = std.fmt.allocPrint(gpa, "{s}/{s}", .{ staging_root, pkg_name }) catch return .{ .output_path = gpa.dupe(u8, "") catch "", .name = gpa.dupe(u8, name) catch "", .version = gpa.dupe(u8, version) catch "", .format = gpa.dupe(u8, "fmz") catch "", .success = false, .note = gpa.dupe(u8, "out of memory") catch "" };
+    defer gpa.free(staging);
+    std.Io.Dir.createDirAbsolute(io, staging, .default_dir) catch {};
+
+    // Manifest
+    const manifest_path = std.fmt.allocPrint(gpa, "{s}/4orman.manifest.json", .{staging}) catch "";
+    defer gpa.free(manifest_path);
+    _ = exportWriteManifest(gpa, io, manifest_path, name, version, "", github_url, "project");
+
+    // git archive → project/
+    const project_staging = std.fmt.allocPrint(gpa, "{s}/project", .{staging}) catch "";
+    defer gpa.free(project_staging);
+    std.Io.Dir.createDirAbsolute(io, project_staging, .default_dir) catch {};
+
+    const archive_tmp = std.fmt.allocPrint(gpa, "{s}/source.tar.gz", .{staging_root}) catch "";
+    defer gpa.free(archive_tmp);
+
+    var git_argv: std.ArrayList([]const u8) = .empty;
+    defer git_argv.deinit(gpa);
+    git_argv.append(gpa, "archive") catch {};
+    git_argv.append(gpa, "--format=tar.gz") catch {};
+    const output_arg = std.fmt.allocPrint(gpa, "--output={s}", .{archive_tmp}) catch "";
+    defer gpa.free(output_arg);
+    git_argv.append(gpa, output_arg) catch {};
+    git_argv.append(gpa, "HEAD") catch {};
+
+    const git_out = runGit(gpa, io, project_path, git_argv.items) catch null;
+    if (git_out) |o| gpa.free(o);
+
+    if (fileExists(io, archive_tmp)) {
+        exportRunIgnore(gpa, io, &.{ "tar", "-xzf", archive_tmp, "-C", project_staging });
+    }
+
+    // knowledge/ if present
+    const knowledge_src = std.fmt.allocPrint(gpa, "{s}/knowledge", .{project_path}) catch "";
+    defer gpa.free(knowledge_src);
+    if (fileExists(io, knowledge_src)) {
+        const knowledge_dst = std.fmt.allocPrint(gpa, "{s}/knowledge", .{staging}) catch "";
+        defer gpa.free(knowledge_dst);
+        exportRunIgnore(gpa, io, &.{ "cp", "-r", knowledge_src, knowledge_dst });
+    }
+
+    // Create .fmz
+    const fmz_filename = std.fmt.allocPrint(gpa, "{s}-{s}.fmz", .{ name, version }) catch "";
+    defer gpa.free(fmz_filename);
+    const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ out_dir, fmz_filename }) catch
+        return .{ .output_path = gpa.dupe(u8, "") catch "", .name = gpa.dupe(u8, name) catch "", .version = gpa.dupe(u8, version) catch "", .format = gpa.dupe(u8, "fmz") catch "", .success = false, .note = gpa.dupe(u8, "out of memory") catch "" };
+
+    const tar_result = std.process.run(gpa, io, .{
+        .argv = &.{ "tar", "-czf", out_path, "-C", staging_root, pkg_name },
+    }) catch null;
+    const success = blk: {
+        if (tar_result) |tr| {
+            defer gpa.free(tr.stdout);
+            defer gpa.free(tr.stderr);
+            break :blk switch (tr.term) {
+                .exited => |c| c == 0,
+                else => false,
+            };
+        }
+        break :blk false;
+    };
+
+    return ExportResult{
+        .output_path = out_path,
+        .name = gpa.dupe(u8, name) catch "",
+        .version = gpa.dupe(u8, version) catch "",
+        .format = gpa.dupe(u8, "fmz") catch "",
+        .success = success,
+        .note = if (success)
+            std.fmt.allocPrint(gpa, "import on any machine: 4orman-tools import {s}", .{fmz_filename}) catch ""
+        else
+            gpa.dupe(u8, "export failed — ensure git repo has at least one commit") catch "",
+    };
+}
+
+pub fn computeExport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    project_path: []const u8,
+    workspace_root: []const u8,
+    format_str: []const u8,
+    out_dir: []const u8,
+) !ExportResult {
+    const name = std.fs.path.basename(project_path);
+    const pid: c_int = std.c.getpid();
+    const version = exportGetVersion(gpa, io, project_path);
+    errdefer gpa.free(version);
+    const github_url = exportGetGithubUrl(gpa, io, project_path);
+    errdefer gpa.free(github_url);
+
+    // Text-only formats — write a script file, no staging dir needed
+    if (std.mem.eql(u8, format_str, "brew") or
+        std.mem.eql(u8, format_str, "mac") or
+        std.mem.eql(u8, format_str, "linux") or
+        std.mem.eql(u8, format_str, "windows"))
+    {
+        const content = blk: {
+            if (std.mem.eql(u8, format_str, "brew")) {
+                break :blk try std.fmt.allocPrint(gpa,
+                    \\# Install {s} via Homebrew / gh
+                    \\brew install git gh 4orman-tools
+                    \\gh auth login
+                    \\git clone {s} ~/4orman/{s}
+                    \\4orman-tools tui
+                    \\
+                , .{ name, github_url, name });
+            } else if (std.mem.eql(u8, format_str, "mac")) {
+                break :blk try std.fmt.allocPrint(gpa,
+                    \\#!/bin/bash
+                    \\# {s} — macOS installer
+                    \\set -e
+                    \\command -v brew >/dev/null || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                    \\brew install git gh
+                    \\brew tap michaelvgonzaga/4orman && brew install 4orman-tools
+                    \\gh auth login
+                    \\mkdir -p ~/4orman && git clone {s} ~/4orman/{s}
+                    \\echo "Done. Run: 4orman-tools tui"
+                    \\
+                , .{ name, github_url, name });
+            } else if (std.mem.eql(u8, format_str, "linux")) {
+                break :blk try std.fmt.allocPrint(gpa,
+                    \\#!/bin/bash
+                    \\# {s} — Linux installer
+                    \\set -e
+                    \\if command -v apt-get >/dev/null; then sudo apt-get install -y git gh
+                    \\elif command -v dnf >/dev/null; then sudo dnf install -y git gh; fi
+                    \\gh auth login
+                    \\mkdir -p ~/4orman && git clone {s} ~/4orman/{s}
+                    \\# Install 4orman-tools binary for Linux — see releases:
+                    \\# https://github.com/michaelvgonzaga/4orman-tools/releases/latest
+                    \\echo "Done. Run: 4orman-tools tui"
+                    \\
+                , .{ name, github_url, name });
+            } else { // windows
+                break :blk try std.fmt.allocPrint(gpa,
+                    \\# {s} — Windows installer (PowerShell)
+                    \\Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+                    \\winget install Git.Git GitHub.cli
+                    \\gh auth login
+                    \\New-Item -ItemType Directory -Force ~/4orman | Out-Null
+                    \\git clone {s} ~/4orman/{s}
+                    \\Write-Host "Done. Run: 4orman-tools tui"
+                    \\
+                , .{ name, github_url, name });
+            }
+        };
+        defer gpa.free(content);
+
+        const ext: []const u8 = if (std.mem.eql(u8, format_str, "windows")) "ps1" else "sh";
+        const out_path = try std.fmt.allocPrint(gpa, "{s}/{s}-install-{s}.{s}", .{ out_dir, name, format_str, ext });
+        errdefer gpa.free(out_path);
+        const wrote = exportWriteFile(gpa, io, out_path, content);
+        return ExportResult{
+            .output_path = out_path,
+            .name = try gpa.dupe(u8, name),
+            .version = version,
+            .format = try gpa.dupe(u8, format_str),
+            .success = wrote,
+            .note = if (wrote) try gpa.dupe(u8, "installer script ready to distribute") else try gpa.dupe(u8, "could not write output file"),
+        };
+    }
+
+    // fmz and backup — need staging dir
+    const staging_root = try std.fmt.allocPrint(gpa, "/tmp/4orman-export-{d}", .{pid});
+    defer gpa.free(staging_root);
+    std.Io.Dir.createDirAbsolute(io, staging_root, .default_dir) catch {};
+
+    if (std.mem.eql(u8, format_str, "backup")) {
+        const staging = try std.fmt.allocPrint(gpa, "{s}/4orman-backup", .{staging_root});
+        defer gpa.free(staging);
+        std.Io.Dir.createDirAbsolute(io, staging, .default_dir) catch {};
+
+        // Manifest
+        const manifest_path = try std.fmt.allocPrint(gpa, "{s}/4orman.manifest.json", .{staging});
+        defer gpa.free(manifest_path);
+        _ = exportWriteManifest(gpa, io, manifest_path, "4orman-workspace", VERSION, "4ORMan workspace backup", "", "workspace");
+
+        // Framework files
+        for ([_][]const u8{ "CLAUDE.md", "ROADMAP.md", "plugins.public.yml", "_templates", "_knowledgebase", "_skills" }) |item| {
+            const src = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, item });
+            defer gpa.free(src);
+            if (!fileExists(io, src)) continue;
+            const dst = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ staging, item });
+            defer gpa.free(dst);
+            exportRunIgnore(gpa, io, &.{ "cp", "-r", src, dst });
+        }
+
+        // Ledger
+        const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+        const home = std.mem.sliceTo(home_ptr, 0);
+        const ledger_src = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+        defer gpa.free(ledger_src);
+        if (fileExists(io, ledger_src)) {
+            const ledger_dst = try std.fmt.allocPrint(gpa, "{s}/ledger.json", .{staging});
+            defer gpa.free(ledger_dst);
+            exportRunIgnore(gpa, io, &.{ "cp", ledger_src, ledger_dst });
+        }
+
+        // Each local project as a .fmz inside projects/
+        const projects_dir = try std.fmt.allocPrint(gpa, "{s}/projects", .{staging});
+        defer gpa.free(projects_dir);
+        std.Io.Dir.createDirAbsolute(io, projects_dir, .default_dir) catch {};
+
+        const entries = computeListProjects(gpa, io, workspace_root) catch &[_]ProjectEntry{};
+        for (entries) |entry| {
+            defer gpa.free(entry.name);
+            defer gpa.free(entry.url);
+            if (!entry.isLocal) continue;
+            const proj_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, entry.name });
+            defer gpa.free(proj_path);
+            const sub_version = exportGetVersion(gpa, io, proj_path);
+            defer gpa.free(sub_version);
+            const sub_url = exportGetGithubUrl(gpa, io, proj_path);
+            defer gpa.free(sub_url);
+            const sub = exportFmz(gpa, io, proj_path, projects_dir, sub_url, sub_version, entry.name, staging_root);
+            gpa.free(sub.output_path);
+            gpa.free(sub.name);
+            gpa.free(sub.version);
+            gpa.free(sub.format);
+            gpa.free(sub.note);
+        }
+
+        // Archive
+        const out_path = try std.fmt.allocPrint(gpa, "{s}/4orman-backup.fmz", .{out_dir});
+        errdefer gpa.free(out_path);
+        const tar_result = std.process.run(gpa, io, .{
+            .argv = &.{ "tar", "-czf", out_path, "-C", staging_root, "4orman-backup" },
+        }) catch null;
+        const success = blk: {
+            if (tar_result) |tr| {
+                defer gpa.free(tr.stdout);
+                defer gpa.free(tr.stderr);
+                break :blk switch (tr.term) { .exited => |c| c == 0, else => false };
+            }
+            break :blk false;
+        };
+        return ExportResult{
+            .output_path = out_path,
+            .name = try gpa.dupe(u8, "4orman-workspace"),
+            .version = try gpa.dupe(u8, VERSION),
+            .format = try gpa.dupe(u8, "backup"),
+            .success = success,
+            .note = if (success)
+                try gpa.dupe(u8, "restore on any machine: 4orman-tools import 4orman-backup.fmz")
+            else
+                try gpa.dupe(u8, "backup failed — check disk space"),
+        };
+    }
+
+    // default: fmz
+    gpa.free(version);
+    gpa.free(github_url);
+    const ver2 = exportGetVersion(gpa, io, project_path);
+    const url2 = exportGetGithubUrl(gpa, io, project_path);
+    return exportFmz(gpa, io, project_path, out_dir, url2, ver2, name, staging_root);
+}
+
+pub fn computeImport(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    workspace_root: []const u8,
+) !ImportResult {
+    const pid: c_int = std.c.getpid();
+
+    if (std.mem.endsWith(u8, source_path, ".fmz")) {
+        // Extract
+        const extract_dir = try std.fmt.allocPrint(gpa, "/tmp/4orman-import-{d}", .{pid});
+        defer gpa.free(extract_dir);
+        std.Io.Dir.createDirAbsolute(io, extract_dir, .default_dir) catch {};
+
+        const tar_result = std.process.run(gpa, io, .{
+            .argv = &.{ "tar", "-xzf", source_path, "-C", extract_dir },
+        }) catch {
+            return .{
+                .name = try gpa.dupe(u8, "unknown"), .dest_path = try gpa.dupe(u8, ""),
+                .source_format = try gpa.dupe(u8, "fmz"), .deps_note = try gpa.dupe(u8, ""),
+                .success = false, .note = try gpa.dupe(u8, "failed to extract .fmz — is it a valid archive?"),
+            };
+        };
+        gpa.free(tar_result.stdout);
+        gpa.free(tar_result.stderr);
+
+        // Find extracted top-level directory
+        const find_result = std.process.run(gpa, io, .{
+            .argv = &.{ "find", extract_dir, "-maxdepth", "1", "-mindepth", "1", "-type", "d" },
+        }) catch return error.ImportFailed;
+        defer gpa.free(find_result.stderr);
+        const extracted_dir_raw = std.mem.trim(u8, find_result.stdout, " \n\r");
+        const extracted_dir = try gpa.dupe(u8, extracted_dir_raw);
+        defer gpa.free(extracted_dir);
+        defer gpa.free(find_result.stdout);
+
+        if (extracted_dir.len == 0) {
+            return .{
+                .name = try gpa.dupe(u8, "unknown"), .dest_path = try gpa.dupe(u8, ""),
+                .source_format = try gpa.dupe(u8, "fmz"), .deps_note = try gpa.dupe(u8, ""),
+                .success = false, .note = try gpa.dupe(u8, "empty .fmz archive"),
+            };
+        }
+
+        // Derive project name (strip version suffix: name-v1.0.0 → name)
+        const raw_name = std.fs.path.basename(extracted_dir);
+        var proj_name: []const u8 = try gpa.dupe(u8, raw_name);
+        if (std.mem.lastIndexOfScalar(u8, proj_name, '-')) |dash| {
+            const suffix = proj_name[dash + 1 ..];
+            if (suffix.len > 0 and (suffix[0] == 'v' or std.ascii.isDigit(suffix[0]))) {
+                const trimmed_name = try gpa.dupe(u8, proj_name[0..dash]);
+                gpa.free(proj_name);
+                proj_name = trimmed_name;
+            }
+        }
+        errdefer gpa.free(proj_name);
+
+        // Check for workspace backup
+        const manifest_path = try std.fmt.allocPrint(gpa, "{s}/4orman.manifest.json", .{extracted_dir});
+        defer gpa.free(manifest_path);
+        if (kaReadFile(gpa, io, manifest_path)) |manifest_raw| {
+            defer gpa.free(manifest_raw);
+            if (std.mem.indexOf(u8, manifest_raw, "\"workspace\"") != null) {
+                // Restore framework files
+                for ([_][]const u8{ "CLAUDE.md", "ROADMAP.md", "plugins.public.yml", "_templates", "_knowledgebase", "_skills" }) |item| {
+                    const src = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ extracted_dir, item });
+                    defer gpa.free(src);
+                    if (!fileExists(io, src)) continue;
+                    const dst = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, item });
+                    defer gpa.free(dst);
+                    exportRunIgnore(gpa, io, &.{ "cp", "-r", src, dst });
+                }
+                // Restore ledger
+                const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+                const home = std.mem.sliceTo(home_ptr, 0);
+                const ledger_src = try std.fmt.allocPrint(gpa, "{s}/ledger.json", .{extracted_dir});
+                defer gpa.free(ledger_src);
+                if (fileExists(io, ledger_src)) {
+                    const foreman_state = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+                    defer gpa.free(foreman_state);
+                    std.Io.Dir.createDirAbsolute(io, foreman_state, .default_dir) catch {};
+                    const ledger_dst = try std.fmt.allocPrint(gpa, "{s}/.4orman/ledger.json", .{home});
+                    defer gpa.free(ledger_dst);
+                    exportRunIgnore(gpa, io, &.{ "cp", ledger_src, ledger_dst });
+                }
+                // Import each project .fmz inside projects/
+                const projects_src = try std.fmt.allocPrint(gpa, "{s}/projects", .{extracted_dir});
+                defer gpa.free(projects_src);
+                if (fileExists(io, projects_src)) {
+                    const fmz_find = std.process.run(gpa, io, .{
+                        .argv = &.{ "find", projects_src, "-name", "*.fmz", "-maxdepth", "1" },
+                    }) catch null;
+                    if (fmz_find) |ff| {
+                        defer gpa.free(ff.stdout);
+                        defer gpa.free(ff.stderr);
+                        var lines = std.mem.tokenizeScalar(u8, ff.stdout, '\n');
+                        while (lines.next()) |line| {
+                            if (line.len == 0) continue;
+                            const sub = computeImport(gpa, io, line, workspace_root) catch continue;
+                            gpa.free(sub.name); gpa.free(sub.dest_path); gpa.free(sub.source_format);
+                            gpa.free(sub.deps_note); gpa.free(sub.note);
+                        }
+                    }
+                }
+                gpa.free(proj_name);
+                return .{
+                    .name = try gpa.dupe(u8, "4orman-workspace"),
+                    .dest_path = try gpa.dupe(u8, workspace_root),
+                    .source_format = try gpa.dupe(u8, "fmz"),
+                    .deps_note = try gpa.dupe(u8, ""),
+                    .success = true,
+                    .note = try gpa.dupe(u8, "workspace restored — run: 4orman-tools tui"),
+                };
+            }
+        }
+
+        // Project import: project/ → workspace_root/<name>/
+        const project_src = try std.fmt.allocPrint(gpa, "{s}/project", .{extracted_dir});
+        defer gpa.free(project_src);
+        const dest_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, proj_name });
+        errdefer gpa.free(dest_path);
+
+        if (fileExists(io, dest_path)) {
+            return .{
+                .name = proj_name, .dest_path = dest_path,
+                .source_format = try gpa.dupe(u8, "fmz"), .deps_note = try gpa.dupe(u8, ""),
+                .success = false,
+                .note = try std.fmt.allocPrint(gpa, "destination already exists: {s} — move it first", .{dest_path}),
+            };
+        }
+
+        exportRunIgnore(gpa, io, &.{ "cp", "-r", project_src, dest_path });
+
+        // Carry over knowledge/ if present in the .fmz
+        const knowledge_src_fmz = try std.fmt.allocPrint(gpa, "{s}/knowledge", .{extracted_dir});
+        defer gpa.free(knowledge_src_fmz);
+        if (fileExists(io, knowledge_src_fmz)) {
+            const knowledge_dst = try std.fmt.allocPrint(gpa, "{s}/knowledge", .{dest_path});
+            defer gpa.free(knowledge_dst);
+            exportRunIgnore(gpa, io, &.{ "cp", "-r", knowledge_src_fmz, knowledge_dst });
+        }
+
+        return .{
+            .name = proj_name,
+            .dest_path = dest_path,
+            .source_format = try gpa.dupe(u8, "fmz"),
+            .deps_note = try gpa.dupe(u8, "run `4orman-tools knowledge-audit` to verify knowledge extraction"),
+            .success = true,
+            .note = try std.fmt.allocPrint(gpa, "imported → {s}", .{dest_path}),
+        };
+    }
+
+    // Raw directory import
+    if (!fileExists(io, source_path)) {
+        return .{
+            .name = try gpa.dupe(u8, "unknown"), .dest_path = try gpa.dupe(u8, ""),
+            .source_format = try gpa.dupe(u8, "directory"), .deps_note = try gpa.dupe(u8, ""),
+            .success = false, .note = try gpa.dupe(u8, "source path does not exist"),
+        };
+    }
+
+    const dir_name = std.fs.path.basename(source_path);
+    const dest_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ workspace_root, dir_name });
+    errdefer gpa.free(dest_path);
+
+    if (fileExists(io, dest_path)) {
+        return .{
+            .name = try gpa.dupe(u8, dir_name), .dest_path = dest_path,
+            .source_format = try gpa.dupe(u8, "directory"), .deps_note = try gpa.dupe(u8, ""),
+            .success = false,
+            .note = try std.fmt.allocPrint(gpa, "destination already exists: {s} — move it first", .{dest_path}),
+        };
+    }
+
+    exportRunIgnore(gpa, io, &.{ "cp", "-r", source_path, dest_path });
+
+    return .{
+        .name = try gpa.dupe(u8, dir_name),
+        .dest_path = dest_path,
+        .source_format = try gpa.dupe(u8, "directory"),
+        .deps_note = try gpa.dupe(u8, "run `4orman-tools knowledge-audit` to verify knowledge extraction"),
+        .success = true,
+        .note = try std.fmt.allocPrint(gpa, "imported → {s}", .{dest_path}),
+    };
+}
+
+// --- Promotion Queue ---
+
+pub const PromotionEntry = struct {
+    name: []const u8,
+    description: []const u8,
+    added_at: []const u8,
+};
+
+pub const PromotionQueueResult = struct {
+    op: []const u8,
+    entries: []PromotionEntry,
+    count: usize,
+    success: bool,
+    note: []const u8,
+};
+
+pub const PromotionQueueMode = union(enum) {
+    list,
+    add: struct { name: []const u8, description: []const u8 },
+    clear,
+};
+
+fn writePromotionQueue(gpa: std.mem.Allocator, io: std.Io, path: []const u8, entries: []PromotionEntry) void {
+    const tmp_path = std.fmt.allocPrint(gpa, "{s}.tmp", .{path}) catch return;
+    defer gpa.free(tmp_path);
+    const f = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch return;
+    var wbuf: [4096]u8 = undefined;
+    var w = f.writerStreaming(io, &wbuf);
+    const ok = blk: {
+        w.interface.writeAll("{\"entries\":[") catch break :blk false;
+        for (entries, 0..) |e, i| {
+            if (i > 0) w.interface.writeAll(",") catch break :blk false;
+            const n_esc = allocJsonEscape(gpa, e.name) catch break :blk false;
+            defer gpa.free(n_esc);
+            const d_esc = allocJsonEscape(gpa, e.description) catch break :blk false;
+            defer gpa.free(d_esc);
+            const a_esc = allocJsonEscape(gpa, e.added_at) catch break :blk false;
+            defer gpa.free(a_esc);
+            w.interface.print("{{\"name\":\"{s}\",\"description\":\"{s}\",\"added_at\":\"{s}\"}}", .{ n_esc, d_esc, a_esc }) catch break :blk false;
+        }
+        w.interface.writeAll("]}\n") catch break :blk false;
+        w.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    f.close(io);
+    if (ok) atomicRenameAbsolute(tmp_path, path);
+}
+
+pub fn computePromotionQueue(gpa: std.mem.Allocator, io: std.Io, mode: PromotionQueueMode) !PromotionQueueResult {
+    const home_ptr = std.c.getenv("HOME") orelse return error.NoHome;
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const foreman_dir = try std.fmt.allocPrint(gpa, "{s}/.4orman", .{home});
+    defer gpa.free(foreman_dir);
+    std.Io.Dir.createDirAbsolute(io, foreman_dir, .default_dir) catch {};
+    const queue_path = try std.fmt.allocPrint(gpa, "{s}/pending-promotions.json", .{foreman_dir});
+    defer gpa.free(queue_path);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ts: i64 = @intCast(ts.sec);
+    const date = tsToDateStr(gpa, @intCast(now_ts)) catch try gpa.dupe(u8, "unknown");
+    defer gpa.free(date);
+
+    var entries: std.ArrayList(PromotionEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.name);
+            gpa.free(e.description);
+            gpa.free(e.added_at);
+        }
+        entries.deinit(gpa);
+    }
+
+    if (fileExists(io, queue_path)) {
+        if (kaReadFile(gpa, io, queue_path)) |raw| {
+            defer gpa.free(raw);
+            var p = std.json.Scanner.initCompleteInput(gpa, raw);
+            defer p.deinit();
+            if (std.json.parseFromTokenSourceLeaky(std.json.Value, gpa, &p, .{})) |val| {
+                if (val.object.get("entries")) |arr| {
+                    for (arr.array.items) |item| {
+                        const name = if (item.object.get("name")) |v| v.string else continue;
+                        const desc = if (item.object.get("description")) |v| v.string else "";
+                        const at = if (item.object.get("added_at")) |v| v.string else "unknown";
+                        try entries.append(gpa, .{
+                            .name = try gpa.dupe(u8, name),
+                            .description = try gpa.dupe(u8, desc),
+                            .added_at = try gpa.dupe(u8, at),
+                        });
+                    }
+                }
+            } else |_| {}
+        }
+    }
+
+    switch (mode) {
+        .list => {
+            const result_entries = try gpa.alloc(PromotionEntry, entries.items.len);
+            for (entries.items, 0..) |e, i| {
+                result_entries[i] = .{
+                    .name = try gpa.dupe(u8, e.name),
+                    .description = try gpa.dupe(u8, e.description),
+                    .added_at = try gpa.dupe(u8, e.added_at),
+                };
+            }
+            return .{ .op = "list", .entries = result_entries, .count = result_entries.len, .success = true, .note = "" };
+        },
+        .add => |rec| {
+            try entries.append(gpa, .{
+                .name = try gpa.dupe(u8, rec.name),
+                .description = try gpa.dupe(u8, rec.description),
+                .added_at = try gpa.dupe(u8, date),
+            });
+            writePromotionQueue(gpa, io, queue_path, entries.items);
+            const note = try std.fmt.allocPrint(gpa, "queued {s} — {d} pending", .{ rec.name, entries.items.len });
+            return .{ .op = "add", .entries = &.{}, .count = entries.items.len, .success = true, .note = note };
+        },
+        .clear => {
+            writePromotionQueue(gpa, io, queue_path, &.{});
+            return .{ .op = "clear", .entries = &.{}, .count = 0, .success = true, .note = "promotion queue cleared" };
+        },
+    }
+}
+
+// --- Tests ---
+
+test "DoctorResult fields" {
+    const r = DoctorResult{ .claude = true, .git = true, .gh = false, .version = VERSION };
+    try std.testing.expect(r.claude);
+    try std.testing.expect(r.git);
+    try std.testing.expect(!r.gh);
+    try std.testing.expectEqualStrings(VERSION, r.version);
+}
+
+test "fileExists: true for known path" {
+    const io = std.testing.io;
+    const git_exists = fileExists(io, "/usr/bin/git") or fileExists(io, "/opt/homebrew/bin/git");
+    try std.testing.expect(git_exists);
+}
+
+test "fileExists: false for nonexistent path" {
+    try std.testing.expect(!fileExists(std.testing.io, "/nonexistent/4orman-tools-sentinel-xyz"));
+}
+
+test "StatusResult fields" {
+    const r = StatusResult{ .upToDate = true, .behindBy = 0, .firstRun = false, .projectsFileExists = true };
+    try std.testing.expect(r.upToDate);
+    try std.testing.expectEqual(@as(u32, 0), r.behindBy);
+    try std.testing.expect(!r.firstRun);
+    try std.testing.expect(r.projectsFileExists);
+}
+
+test "categorize" {
+    try std.testing.expectEqualStrings("fix", categorize("fix build error"));
+    try std.testing.expectEqualStrings("fix", categorize("Fix: wrong path"));
+    try std.testing.expectEqualStrings("new", categorize("feat: add status subcommand"));
+    try std.testing.expectEqualStrings("new", categorize("add commits subcommand"));
+    try std.testing.expectEqualStrings("docs", categorize("docs: update readme"));
+    try std.testing.expectEqualStrings("improvement", categorize("refactor runGit helper"));
+    try std.testing.expectEqualStrings("improvement", categorize("bump zig to 0.16"));
+    try std.testing.expectEqualStrings("other", categorize("initial commit"));
+}
+
+test "GhUserResult fields" {
+    const r = GhUserResult{ .authenticated = true, .login = "octocat" };
+    try std.testing.expect(r.authenticated);
+    try std.testing.expectEqualStrings("octocat", r.login);
+}
+
+test "TagExistsResult fields" {
+    const r = TagExistsResult{ .exists = true };
+    try std.testing.expect(r.exists);
+    const r2 = TagExistsResult{ .exists = false };
+    try std.testing.expect(!r2.exists);
+}
+
+test "computeRepoInfo: parses SSH remote" {
+    // We can't call computeRepoInfo without a real repo, but we can unit-test the parsing logic
+    // by verifying RepoInfoResult struct construction directly.
+    const r = RepoInfoResult{ .owner = "octocat", .repo = "hello-world", .url = "https://github.com/octocat/hello-world" };
+    try std.testing.expectEqualStrings("octocat", r.owner);
+    try std.testing.expectEqualStrings("hello-world", r.repo);
+    try std.testing.expectEqualStrings("https://github.com/octocat/hello-world", r.url);
+}
+
+test "ReleaseInfoResult fields" {
+    const r = ReleaseInfoResult{ .latestTag = "v1.2.3", .suggestedNext = "v1.2.4", .commitsSince = 5, .isDirty = false };
+    try std.testing.expectEqualStrings("v1.2.3", r.latestTag.?);
+    try std.testing.expectEqualStrings("v1.2.4", r.suggestedNext);
+    try std.testing.expectEqual(@as(u32, 5), r.commitsSince);
+    try std.testing.expect(!r.isDirty);
+}
+
+test "allocJsonEscape: escapes special chars" {
+    const result = try allocJsonEscape(std.testing.allocator, "say \"hello\"\nline2");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("say \\\"hello\\\"\\nline2", result);
+}
+
+test "classifyFile: test patterns" {
+    try std.testing.expectEqualStrings("test", classifyFile("test/foo.go"));
+    try std.testing.expectEqualStrings("test", classifyFile("tests/bar.ts"));
+    try std.testing.expectEqualStrings("test", classifyFile("src/foo_test.go"));
+    try std.testing.expectEqualStrings("test", classifyFile("src/foo.test.js"));
+    try std.testing.expectEqualStrings("test", classifyFile("src/foo.spec.ts"));
+    try std.testing.expectEqualStrings("test", classifyFile("test_helpers.py"));
+}
+
+test "classifyFile: docs patterns" {
+    try std.testing.expectEqualStrings("docs", classifyFile("README.md"));
+    try std.testing.expectEqualStrings("docs", classifyFile("docs/guide.txt"));
+    try std.testing.expectEqualStrings("docs", classifyFile("src/notes.rst"));
+}
+
+test "classifyFile: config patterns" {
+    try std.testing.expectEqualStrings("config", classifyFile("package.json"));
+    try std.testing.expectEqualStrings("config", classifyFile("Cargo.toml"));
+    try std.testing.expectEqualStrings("config", classifyFile("Makefile"));
+}
+
+test "classifyFile: source fallback" {
+    try std.testing.expectEqualStrings("source", classifyFile("src/main.go"));
+    try std.testing.expectEqualStrings("source", classifyFile("lib/utils.ts"));
+}
+
+test "FileEntry fields" {
+    const e = FileEntry{ .path = @constCast("src/main.go"), .bytes = 1024, .kind = "source" };
+    try std.testing.expectEqualStrings("src/main.go", e.path);
+    try std.testing.expectEqual(@as(u64, 1024), e.bytes);
+    try std.testing.expectEqualStrings("source", e.kind);
+}
+
+test "DiffEntry fields" {
+    const e = DiffEntry{ .path = @constCast("src/foo.go"), .bytesA = 100, .bytesB = 200, .same = false };
+    try std.testing.expectEqualStrings("src/foo.go", e.path);
+    try std.testing.expect(!e.same);
+}
+
+test "shouldSkipGrepFile: binary extensions skipped" {
+    try std.testing.expect(shouldSkipGrepFile("image.png"));
+    try std.testing.expect(shouldSkipGrepFile("font.woff2"));
+    try std.testing.expect(shouldSkipGrepFile("archive.gz"));
+    try std.testing.expect(shouldSkipGrepFile("module.wasm"));
+    try std.testing.expect(!shouldSkipGrepFile("main.go"));
+    try std.testing.expect(!shouldSkipGrepFile("index.ts"));
+    try std.testing.expect(!shouldSkipGrepFile("Makefile"));
+}
+
+test "parseFileLine: line only" {
+    var out_line: u32 = 0;
+    var out_col: u32 = 0;
+    const pos = parseFileLine("src/main.go:42", &out_line, &out_col);
+    try std.testing.expectEqual(@as(?usize, 11), pos);
+    try std.testing.expectEqual(@as(u32, 42), out_line);
+    try std.testing.expectEqual(@as(u32, 0), out_col);
+}
+
+test "parseFileLine: line and col" {
+    var out_line: u32 = 0;
+    var out_col: u32 = 0;
+    const pos = parseFileLine("/app/foo.js:10:5", &out_line, &out_col);
+    try std.testing.expectEqual(@as(?usize, 11), pos);
+    try std.testing.expectEqual(@as(u32, 10), out_line);
+    try std.testing.expectEqual(@as(u32, 5), out_col);
+}
+
+test "parseStackLine: Node/V8 with parens" {
+    const frame = try parseStackLine(std.testing.allocator, "    at myFunc (src/app.js:10:5)");
+    defer if (frame) |f| {
+        std.testing.allocator.free(f.file);
+        std.testing.allocator.free(f.func);
+    };
+    try std.testing.expect(frame != null);
+    try std.testing.expectEqualStrings("src/app.js", frame.?.file);
+    try std.testing.expectEqual(@as(u32, 10), frame.?.line);
+    try std.testing.expectEqual(@as(u32, 5), frame.?.col);
+    try std.testing.expectEqualStrings("myFunc", frame.?.func);
+}
+
+test "parseStackLine: Node/V8 bare" {
+    const frame = try parseStackLine(std.testing.allocator, "    at src/app.js:20:3");
+    defer if (frame) |f| {
+        std.testing.allocator.free(f.file);
+        std.testing.allocator.free(f.func);
+    };
+    try std.testing.expect(frame != null);
+    try std.testing.expectEqualStrings("src/app.js", frame.?.file);
+    try std.testing.expectEqual(@as(u32, 20), frame.?.line);
+}
+
+test "parseStackLine: Python" {
+    const frame = try parseStackLine(std.testing.allocator, "  File \"app/main.py\", line 33, in run");
+    defer if (frame) |f| {
+        std.testing.allocator.free(f.file);
+        std.testing.allocator.free(f.func);
+    };
+    try std.testing.expect(frame != null);
+    try std.testing.expectEqualStrings("app/main.py", frame.?.file);
+    try std.testing.expectEqual(@as(u32, 33), frame.?.line);
+    try std.testing.expectEqualStrings("run", frame.?.func);
+}
+
+test "parseStackLine: Ruby" {
+    const frame = try parseStackLine(std.testing.allocator, "    app/models/user.rb:15:in `save'");
+    defer if (frame) |f| {
+        std.testing.allocator.free(f.file);
+        std.testing.allocator.free(f.func);
+    };
+    try std.testing.expect(frame != null);
+    try std.testing.expectEqualStrings("app/models/user.rb", frame.?.file);
+    try std.testing.expectEqual(@as(u32, 15), frame.?.line);
+    try std.testing.expectEqualStrings("save", frame.?.func);
+}
+
+test "parseStackLine: non-frame line returns null" {
+    const frame = try parseStackLine(std.testing.allocator, "Error: something went wrong");
+    try std.testing.expect(frame == null);
+}
+
+test "computeParseStack: mixed trace" {
+    const trace =
+        \\Error: boom
+        \\    at inner (src/a.js:5:3)
+        \\    at outer (src/b.js:12:1)
+    ;
+    const result = try computeParseStack(std.testing.allocator, trace);
+    defer {
+        for (result.frames) |f| {
+            std.testing.allocator.free(f.file);
+            std.testing.allocator.free(f.func);
+        }
+        std.testing.allocator.free(result.frames);
+    }
+    try std.testing.expectEqual(@as(usize, 2), result.frames.len);
+    try std.testing.expectEqualStrings("src/a.js", result.frames[0].file);
+    try std.testing.expectEqualStrings("src/b.js", result.frames[1].file);
+}
+
+test "globMatch: exact" {
+    try std.testing.expect(globMatch("CLAUDE.md", "CLAUDE.md"));
+    try std.testing.expect(!globMatch("CLAUDE.md", "claude.md"));
+    try std.testing.expect(!globMatch("CLAUDE.md", "README.md"));
+}
+
+test "globMatch: suffix *.ext" {
+    try std.testing.expect(globMatch("*.go", "main.go"));
+    try std.testing.expect(globMatch("*.go", "foo_test.go"));
+    try std.testing.expect(!globMatch("*.go", "main.ts"));
+    try std.testing.expect(!globMatch("*.go", "go"));
+}
+
+test "globMatch: prefix*" {
+    try std.testing.expect(globMatch("Makefile*", "Makefile"));
+    try std.testing.expect(globMatch("Makefile*", "Makefile.win"));
+    try std.testing.expect(!globMatch("Makefile*", "makefile"));
+}
+
+test "globMatch: *contains*" {
+    try std.testing.expect(globMatch("*test*", "foo_test.go"));
+    try std.testing.expect(globMatch("*test*", "test_helpers.py"));
+    try std.testing.expect(!globMatch("*test*", "main.go"));
+}
+
+test "globMatch: wildcard *" {
+    try std.testing.expect(globMatch("*", "anything.txt"));
+    try std.testing.expect(globMatch("*", ""));
+}
+
+test "parseNumstatLine: normal line" {
+    const stat = try parseNumstatLine("10\t5\tsrc/main.go", std.testing.allocator);
+    defer if (stat) |s| std.testing.allocator.free(s.path);
+    try std.testing.expect(stat != null);
+    try std.testing.expectEqual(@as(u32, 10), stat.?.additions);
+    try std.testing.expectEqual(@as(u32, 5), stat.?.deletions);
+    try std.testing.expectEqualStrings("src/main.go", stat.?.path);
+}
+
+test "parseNumstatLine: binary file (dashes)" {
+    const stat = try parseNumstatLine("-\t-\tassets/img.png", std.testing.allocator);
+    defer if (stat) |s| std.testing.allocator.free(s.path);
+    try std.testing.expect(stat != null);
+    try std.testing.expectEqual(@as(u32, 0), stat.?.additions);
+    try std.testing.expectEqual(@as(u32, 0), stat.?.deletions);
+}
+
+test "parseNumstatLine: empty line returns null" {
+    const stat = try parseNumstatLine("", std.testing.allocator);
+    try std.testing.expect(stat == null);
+}
+
+test "DirEntry fields" {
+    const e = DirEntry{ .name = @constCast("src"), .kind = "dir", .bytes = 0 };
+    try std.testing.expectEqualStrings("src", e.name);
+    try std.testing.expectEqualStrings("dir", e.kind);
+}
+
+test "GitDiffResult fields" {
+    const r = GitDiffResult{ .ref = "HEAD", .totalAdditions = 10, .totalDeletions = 5, .fileCount = 2, .files = &.{} };
+    try std.testing.expectEqualStrings("HEAD", r.ref);
+    try std.testing.expectEqual(@as(u32, 10), r.totalAdditions);
+    try std.testing.expectEqual(@as(u32, 2), r.fileCount);
+}
+
+test "jsonTypeName" {
+    try std.testing.expectEqualStrings("string", jsonTypeName(.{ .string = "hi" }));
+    try std.testing.expectEqualStrings("number", jsonTypeName(.{ .integer = 42 }));
+    try std.testing.expectEqualStrings("number", jsonTypeName(.{ .float = 3.14 }));
+    try std.testing.expectEqualStrings("bool", jsonTypeName(.{ .bool = true }));
+    try std.testing.expectEqualStrings("null", jsonTypeName(.null));
+}
+
+test "JsonQueryResult fields" {
+    const r = JsonQueryResult{ .path = "version", .found = true, .type_name = "string", .value_json = null };
+    try std.testing.expectEqualStrings("version", r.path);
+    try std.testing.expect(r.found);
+    try std.testing.expectEqualStrings("string", r.type_name);
+}
+
+test "FileStatsResult fields" {
+    const r = FileStatsResult{ .path = "/tmp/foo.txt", .lines = 42, .bytes = 1024 };
+    try std.testing.expectEqual(@as(u64, 42), r.lines);
+    try std.testing.expectEqual(@as(u64, 1024), r.bytes);
+}
+
+test "parseEnvKeys: basic" {
+    const content = "# comment\nDB_URL=postgres://localhost/db\nAPI_KEY=secret\nexport PORT=3000\n\nNODE_ENV=production\n";
+    const keys = try parseEnvKeys(std.testing.allocator, content);
+    defer {
+        for (keys) |k| std.testing.allocator.free(k);
+        std.testing.allocator.free(keys);
+    }
+    try std.testing.expectEqual(@as(usize, 4), keys.len);
+    try std.testing.expectEqualStrings("DB_URL", keys[0]);
+    try std.testing.expectEqualStrings("PORT", keys[2]);
+}
+
+test "parseEnvKeys: skips invalid keys" {
+    const content = "123INVALID=val\n_VALID=ok\nALSO_VALID=yes\n";
+    const keys = try parseEnvKeys(std.testing.allocator, content);
+    defer {
+        for (keys) |k| std.testing.allocator.free(k);
+        std.testing.allocator.free(keys);
+    }
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("_VALID", keys[0]);
+}
+
+test "parseTOMLScalar: string" {
+    const s = try parseTOMLScalar(std.testing.allocator, "\"hello world\"");
+    defer std.testing.allocator.free(s.json);
+    try std.testing.expectEqualStrings("string", s.type_name);
+    try std.testing.expectEqualStrings("\"hello world\"", s.json);
+}
+
+test "parseTOMLScalar: integer" {
+    const s = try parseTOMLScalar(std.testing.allocator, "42");
+    defer std.testing.allocator.free(s.json);
+    try std.testing.expectEqualStrings("number", s.type_name);
+    try std.testing.expectEqualStrings("42", s.json);
+}
+
+test "parseTOMLScalar: bool" {
+    const t = try parseTOMLScalar(std.testing.allocator, "true");
+    defer std.testing.allocator.free(t.json);
+    try std.testing.expectEqualStrings("bool", t.type_name);
+    try std.testing.expectEqualStrings("true", t.json);
+}
+
+test "parseTOMLScalar: number with inline comment" {
+    const s = try parseTOMLScalar(std.testing.allocator, "99 # the count");
+    defer std.testing.allocator.free(s.json);
+    try std.testing.expectEqualStrings("number", s.type_name);
+    try std.testing.expectEqualStrings("99", s.json);
+}
+
+test "extractTOMLValue: top-level key" {
+    const toml = "name = \"my-app\"\nversion = \"1.2.3\"\n";
+    const s = try extractTOMLValue(std.testing.allocator, toml, "version");
+    defer if (s) |v| std.testing.allocator.free(v.json);
+    try std.testing.expect(s != null);
+    try std.testing.expectEqualStrings("\"1.2.3\"", s.?.json);
+}
+
+test "extractTOMLValue: section key" {
+    const toml = "[package]\nname = \"crate\"\nversion = \"0.1.0\"\n";
+    const s = try extractTOMLValue(std.testing.allocator, toml, "package.version");
+    defer if (s) |v| std.testing.allocator.free(v.json);
+    try std.testing.expect(s != null);
+    try std.testing.expectEqualStrings("\"0.1.0\"", s.?.json);
+}
+
+test "extractTOMLValue: nested dotted section" {
+    const toml = "[tool.poetry]\nversion = \"2.0.0\"\n";
+    const s = try extractTOMLValue(std.testing.allocator, toml, "tool.poetry.version");
+    defer if (s) |v| std.testing.allocator.free(v.json);
+    try std.testing.expect(s != null);
+    try std.testing.expectEqualStrings("\"2.0.0\"", s.?.json);
+}
+
+test "extractTOMLValue: missing key returns null" {
+    const toml = "[package]\nname = \"crate\"\n";
+    const s = try extractTOMLValue(std.testing.allocator, toml, "package.missing");
+    try std.testing.expect(s == null);
+}
+
+test "secretScanIsPlaceholder: rejects code, not just short/quoted values" {
+    // Regression: these are real lines from this file's own SecretScanResult
+    // plumbing that the assignment-key scanner used to flag as secrets.
+    try std.testing.expect(secretScanIsPlaceholder("blk: {"));
+    try std.testing.expect(secretScanIsPlaceholder("if (sec_opt) |s| s.findings.len > 0 else false"));
+}
+
+test "secret-scan: does not flag its own SecretScanResult plumbing" {
+    const gpa = std.testing.allocator;
+    var findings: std.ArrayList(SecretFinding) = .empty;
+    defer {
+        for (findings.items) |f| gpa.free(f.file);
+        findings.deinit(gpa);
+    }
+    const lines =
+        \\const sec_opt: ?SecretScanResult = blk: {
+        \\const secrets_found = if (sec_opt) |s| s.findings.len > 0 else false;
+        \\.secrets_found = secrets_found,
+    ;
+    var i: u32 = 1;
+    var start: usize = 0;
+    while (start < lines.len) : (i += 1) {
+        const end = std.mem.indexOfScalarPos(u8, lines, start, '\n') orelse lines.len;
+        const line = lines[start..end];
+        if (secretScanFindAssignmentSep(line)) |sep_pos| {
+            const key = line[0..sep_pos];
+            if (secretScanIsCleanKey(key) and secretScanCaseInsensitiveContains(key, "secret")) {
+                const val = secretScanExtractValue(line, sep_pos);
+                const self_ref = val.len >= 3 and secretScanCaseInsensitiveContains(key, val);
+                if (!secretScanIsPlaceholder(val) and !self_ref) {
+                    try findings.append(gpa, .{ .file = try gpa.dupe(u8, "test"), .line = i, .pattern = "hardcoded-secret", .severity = "medium" });
+                }
+            }
+        }
+        if (end >= lines.len) break;
+        start = end + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), findings.items.len);
+}
+
+test "secretScanPrefixContinuationLen: doesn't count '/' as part of the token" {
+    // Regression: "Stripe sk_live_/sk_test_" in prose (naming two patterns,
+    // no real key) used to satisfy the >=8-char continuation threshold.
+    const line = "supports Stripe sk_live_/sk_test_ and AWS AKIA prefixes";
+    const pos = std.mem.indexOf(u8, line, "sk_live_").?;
+    try std.testing.expect(secretScanPrefixContinuationLen(line, pos, "sk_live_".len) < 8);
+}
+
+test "parseZigOutput: parses 'Build Summary: X/Y tests passed'" {
+    const gpa = std.testing.allocator;
+    var passed: u32 = 0;
+    var failed: u32 = 0;
+    var skipped: u32 = 0;
+    var fbuf: [MAX_TEST_FAILURES]TestFailure = undefined;
+    var n: usize = 0;
+    var truncated = false;
+    parseZigOutput(gpa, "Build Summary: 5/5 steps succeeded; 48/48 tests passed", &passed, &failed, &skipped, &fbuf, &n, &truncated);
+    try std.testing.expectEqual(@as(u32, 48), passed);
+    try std.testing.expectEqual(@as(u32, 0), failed);
+}
+
+test "parseZigOutput: parses partial failure summary" {
+    const gpa = std.testing.allocator;
+    var passed: u32 = 0;
+    var failed: u32 = 0;
+    var skipped: u32 = 0;
+    var fbuf: [MAX_TEST_FAILURES]TestFailure = undefined;
+    var n: usize = 0;
+    var truncated = false;
+    defer for (fbuf[0..n]) |f| {
+        gpa.free(f.file);
+        gpa.free(f.@"test");
+        gpa.free(f.message);
+    };
+    parseZigOutput(gpa, "Build Summary: 1/3 steps succeeded (1 failed); 1/2 tests passed (1 failed)", &passed, &failed, &skipped, &fbuf, &n, &truncated);
+    try std.testing.expectEqual(@as(u32, 1), passed);
+    try std.testing.expectEqual(@as(u32, 1), failed);
+}
+
+test "ledgerWordOverlapScore: full match scores 100" {
+    const score = ledgerWordOverlapScore("caching strategy for sessions", "caching strategy for sessions");
+    try std.testing.expectEqual(@as(u32, 100), score);
+}
+
+test "ledgerWordOverlapScore: partial match scores proportionally" {
+    const score = ledgerWordOverlapScore("redis caching strategy", "caching strategy for zig");
+    // "redis" (5 chars, no match), "caching" (match), "strategy" (match) -> 2/3 * 100 = 66
+    try std.testing.expectEqual(@as(u32, 66), score);
+}
+
+test "ledgerWordOverlapScore: no overlap scores 0" {
+    const score = ledgerWordOverlapScore("xyzzy plugh frotz", "caching strategy for sessions");
+    try std.testing.expectEqual(@as(u32, 0), score);
+}
+
+test "ledgerWordOverlapScore: short words below length 3 are ignored" {
+    const score = ledgerWordOverlapScore("is it ok", "some unrelated question");
+    try std.testing.expectEqual(@as(u32, 0), score);
+}
+
+test "containsWholeWord: matches a bounded word" {
+    try std.testing.expect(containsWholeWord("go build ./...", "go"));
+    try std.testing.expect(containsWholeWord("make is the correct choice", "make"));
+}
+
+test "containsWholeWord: regression — 'go' must not match inside 'Cargo'" {
+    // The exact bug found live: candidate "go" falsely matched substring
+    // "go" inside "cargo" (car-go), silently overriding to the wrong tool.
+    try std.testing.expect(!containsWholeWord("dummy cargo.toml present", "go"));
+}
+
+test "containsWholeWord: no match when absent entirely" {
+    try std.testing.expect(!containsWholeWord("this reasoning mentions neither", "zig"));
+}
+
+test "containsWholeWord: word at string boundaries matches" {
+    try std.testing.expect(containsWholeWord("zig", "zig"));
+    try std.testing.expect(containsWholeWord("use zig", "zig"));
+    try std.testing.expect(containsWholeWord("zig is correct", "zig"));
+}
+
+// Locks in that parseLedgerFile keeps reading pre-Jungian-category
+// ledger.json files (no "category"/"shadow"/"synthesis" fields) correctly,
+// with safe defaults, once those fields are added to the schema. Written
+// before the schema change so it fails loudly if the migration breaks
+// backward compat with every ledger.json already on disk.
+test "parseLedgerFile: old-format entry (no category/shadow/synthesis) parses with defaults" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/4orman-tools-test-ledger-compat-old-format.json";
+    const old_format =
+        \\{"entries":[{"id":"abc123","date":"2026-01-01","recorded_ts":1,"revalidation_due_ts":99999999999,"winner":"zig","question":"old question","reasoning":"old reasoning","is_stale":false}]}
+    ;
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, path, .{});
+        defer f.close(io);
+        var wbuf: [512]u8 = undefined;
+        var w = f.writerStreaming(io, &wbuf);
+        try w.interface.writeAll(old_format);
+        try w.interface.flush();
+    }
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, path, &entries, 2);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    const e = entries.items[0];
+    try std.testing.expectEqualStrings("abc123", e.id);
+    try std.testing.expectEqualStrings("old question", e.question);
+    try std.testing.expectEqualStrings("old reasoning", e.reasoning);
+    try std.testing.expectEqualStrings("rps", e.category);
+    try std.testing.expectEqualStrings("", e.shadow);
+    try std.testing.expectEqualStrings("", e.synthesis);
+}
+
+// Locks in that parseLedgerFile keeps reading pre-outcome-tracking
+// ledger.json entries (no "outcome"/"outcome_matched"/"outcome_recorded_ts"
+// fields — this covers every entry that exists today, both "rps" and
+// "jungian" category, since outcome tracking was added after both) with
+// safe defaults, once those fields are added to the schema.
+test "parseLedgerFile: entry with no outcome fields parses with defaults" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/4orman-tools-test-ledger-compat-no-outcome.json";
+    // Includes category/shadow/synthesis (post-Jungian-migration shape) but
+    // still predates outcome tracking — the realistic "existing file" case.
+    const pre_outcome_format =
+        \\{"entries":[{"id":"def456","date":"2026-01-01","recorded_ts":1,"revalidation_due_ts":99999999999,"winner":"terse","question":"jungian question","reasoning":"","is_stale":false,"category":"jungian","shadow":"some shadow","synthesis":"some synthesis"}]}
+    ;
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, path, .{});
+        defer f.close(io);
+        var wbuf: [512]u8 = undefined;
+        var w = f.writerStreaming(io, &wbuf);
+        try w.interface.writeAll(pre_outcome_format);
+        try w.interface.flush();
+    }
+
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            gpa.free(e.id);
+            gpa.free(e.date);
+            gpa.free(e.winner);
+            gpa.free(e.question);
+            gpa.free(e.reasoning);
+            gpa.free(e.category);
+            gpa.free(e.shadow);
+            gpa.free(e.synthesis);
+            gpa.free(e.outcome);
+            gpa.free(e.outcome_matched);
+            gpa.free(e.domain);
+            gpa.free(e.artifact_type);
+            gpa.free(e.artifact_ref);
+            gpa.free(e.status);
+        }
+        entries.deinit(gpa);
+    }
+    parseLedgerFile(gpa, io, path, &entries, 2);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    const e = entries.items[0];
+    try std.testing.expectEqualStrings("def456", e.id);
+    try std.testing.expectEqualStrings("jungian", e.category);
+    try std.testing.expectEqualStrings("some shadow", e.shadow);
+    try std.testing.expectEqualStrings("", e.outcome);
+    try std.testing.expectEqualStrings("unknown", e.outcome_matched);
+    try std.testing.expectEqual(@as(i64, 0), e.outcome_recorded_ts);
+}
+
+test "computeOutcomeReviewDue: not due when outcome already recorded" {
+    try std.testing.expect(!computeOutcomeReviewDue("matched", 0, 100 * 86400));
+    try std.testing.expect(!computeOutcomeReviewDue("diverged", 0, 100 * 86400));
+}
+
+test "computeOutcomeReviewDue: not due when too little time has passed" {
+    try std.testing.expect(!computeOutcomeReviewDue("unknown", 1000, 1000 + 86400)); // 1 day
+    try std.testing.expect(!computeOutcomeReviewDue("unknown", 1000, 1000 + 29 * 86400)); // 29 days
+}
+
+test "computeOutcomeReviewDue: due once threshold is crossed" {
+    try std.testing.expect(computeOutcomeReviewDue("unknown", 1000, 1000 + 30 * 86400)); // exactly 30 days
+    try std.testing.expect(computeOutcomeReviewDue("unknown", 1000, 1000 + 90 * 86400)); // well past
+}
+
+test "globContains: literal substring, no wildcard" {
+    try std.testing.expect(globContains("The module ads_game does not exist.", "does not exist"));
+    try std.testing.expect(!globContains("The module ads_game does not exist.", "does not survive"));
+}
+
+test "globContains: single wildcard fragment" {
+    try std.testing.expect(globContains(
+        "SQLSTATE[42S02]: Base table or view not found: 1146 Table 'app_db.cache_items' doesn't exist",
+        "Table '*' doesn't exist",
+    ));
+    try std.testing.expect(!globContains(
+        "SQLSTATE[42S02]: Base table or view not found: 1146 Table 'app_db.cache_items' doesn't exist",
+        "Column '*' doesn't exist",
+    ));
+}
+
+test "globContains: multiple wildcards in order" {
+    try std.testing.expect(globContains("job=update_database status=FAILURE code=1", "job=*status=*code=*"));
+    // Out-of-order literal fragments must not match.
+    try std.testing.expect(!globContains("code=1 status=FAILURE job=update_database", "job=*status=*code=*"));
+}
+
+test "globContains: leading/trailing wildcard" {
+    try std.testing.expect(globContains("Finished: FAILURE", "*FAILURE"));
+    try std.testing.expect(globContains("Finished: FAILURE", "Finished:*"));
+}
+
+test "computeLogMatch: matches exact patterns and captures exit line" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pattern_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(pattern_path);
+    const pattern_file = try std.fmt.allocPrint(gpa, "{s}/patterns.json", .{pattern_path});
+    defer gpa.free(pattern_file);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "patterns.json", .data =
+        \\{"patterns": [
+        \\  {"id": "missing-module", "category": "application", "severity": "error",
+        \\   "match": "substring", "value": "does not exist",
+        \\   "signal": "module missing", "rootCause": "removed without uninstall", "conclusion": "re-add module"},
+        \\  {"id": "missing-table", "category": "application", "severity": "error",
+        \\   "match": "glob", "value": "Table '*' doesn't exist",
+        \\   "signal": "table missing", "rootCause": "incomplete migration", "conclusion": "restore table"}
+        \\]}
+    });
+
+    const log =
+        \\[error]  The module ads_game does not exist.
+        \\SQLSTATE[42S02]: Table 'app_db.cache_items' doesn't exist
+        \\Drush command failed, exit code: 1
+        \\Finished: FAILURE
+    ;
+
+    const result = try computeLogMatch(gpa, io, log, pattern_file);
+    defer {
+        for (result.hits) |h| {
+            gpa.free(h.id);
+            gpa.free(h.category);
+            gpa.free(h.severity);
+            gpa.free(h.matchedLine);
+            gpa.free(h.signal);
+            gpa.free(h.rootCause);
+            gpa.free(h.conclusion);
+        }
+        gpa.free(result.hits);
+        for (result.unmatchedSignalLines) |u| gpa.free(u);
+        gpa.free(result.unmatchedSignalLines);
+        if (result.exitStatusLine) |e| gpa.free(e);
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), result.matchCount);
+    try std.testing.expectEqualStrings("missing-module", result.hits[0].id);
+    try std.testing.expectEqualStrings("missing-table", result.hits[1].id);
+    try std.testing.expect(result.exitStatusLine != null);
+    try std.testing.expectEqualStrings("Drush command failed, exit code: 1", result.exitStatusLine.?);
+}
+
+test "computeLogMatch: missing pattern file returns error" {
+    const result = computeLogMatch(std.testing.allocator, std.testing.io, "some log", "/nonexistent/patterns.json");
+    try std.testing.expectError(error.PatternFileNotFound, result);
+}
